@@ -1,0 +1,124 @@
+<mxfile host="app.diagrams.net" agent="drawio" type="device">
+  <diagram id="uc-collect-002" name="内容采集与存储子系统">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="内容采集与存储子系统用例图" style="text;html=1;align=center;verticalAlign=middle;fontSize=20;fontStyle=1;fontColor=#0D47A1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="8" width="1000" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="本子系统是系统地基：全部价值都建立在“复制的一瞬间内容被正确接住并可靠存下”之上" style="text;html=1;align=center;verticalAlign=middle;fontSize=12;fontColor=#546E7A;" vertex="1" parent="1">
+          <mxGeometry x="220" y="46" width="1120" height="24" as="geometry"/>
+        </mxCell>
+        <mxCell id="A1" value="用户" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;fillColor=#FFF8E1;strokeColor=#F57C00;strokeWidth=2;fontSize=14;fontStyle=1;fontColor=#E65100;" vertex="1" parent="1">
+          <mxGeometry x="60" y="300" width="40" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="A2" value="系统剪贴板监听器" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;fillColor=#F3E5F5;strokeColor=#7B1FA2;strokeWidth=2;fontSize=14;fontStyle=1;fontColor=#4A148C;" vertex="1" parent="1">
+          <mxGeometry x="60" y="560" width="40" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="A3" value="本地数据库" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;fillColor=#F3E5F5;strokeColor=#7B1FA2;strokeWidth=2;fontSize=14;fontStyle=1;fontColor=#4A148C;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="260" width="40" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="A6" value="本地文件系统" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;fillColor=#E0F2F1;strokeColor=#00796B;strokeWidth=2;fontSize=14;fontStyle=1;fontColor=#004D40;" vertex="1" parent="1">
+          <mxGeometry x="1110" y="780" width="40" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="boundary" value="内容采集与存储子系统" style="rounded=0;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#1976D2;strokeWidth=2;verticalAlign=top;align=center;fontSize=15;fontStyle=1;fontColor=#0D47A1;spacingTop=8;" vertex="1" parent="1">
+          <mxGeometry x="230" y="120" width="820" height="820" as="geometry"/>
+        </mxCell>
+        <mxCell id="U01" value="UC-01 监听剪贴板变化&lt;br&gt;并采集内容" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;strokeWidth=2;fontSize=12;fontStyle=1;fontColor=#1B5E20;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="260" y="180" width="230" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U02" value="UC-02 识别并归类内容格式" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E8F4FD;strokeColor=#1976D2;fontSize=12;fontColor=#0D47A1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="260" y="300" width="230" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U03" value="UC-03 持久化保存记录" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;strokeWidth=2;fontSize=12;fontStyle=1;fontColor=#1B5E20;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="260" y="420" width="230" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U06" value="UC-06 重复内容合并刷新" style="ellipse;whiteSpace=wrap;html=1;fillColor=#C8E6C9;strokeColor=#2E7D32;strokeWidth=2;fontSize=12;fontStyle=1;fontColor=#1B5E20;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="260" y="540" width="230" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U14" value="UC-14 暂停与恢复监听" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E8F4FD;strokeColor=#1976D2;fontSize=12;fontColor=#0D47A1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="260" y="660" width="230" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U05" value="UC-05 超限自动裁剪历史" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E8F4FD;strokeColor=#1976D2;fontSize=12;fontColor=#0D47A1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="260" y="780" width="230" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U17" value="UC-17 识别并脱敏敏感信息" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E8F4FD;strokeColor=#1976D2;fontSize=12;fontColor=#0D47A1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="620" y="300" width="240" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U04" value="UC-04 配置存储容量上限" style="ellipse;whiteSpace=wrap;html=1;fillColor=#E8F4FD;strokeColor=#1976D2;fontSize=12;fontColor=#0D47A1;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="620" y="780" width="240" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="U20" value="UC-20 启动初始化&lt;br&gt;与历史恢复" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#EF6C00;fontSize=12;fontColor=#E65100;verticalAlign=middle;align=center;" vertex="1" parent="1">
+          <mxGeometry x="620" y="540" width="240" height="66" as="geometry"/>
+        </mxCell>
+        <mxCell id="a1" style="endArrow=none;html=1;strokeColor=#F57C00;strokeWidth=1;" edge="1" parent="1" source="A1" target="U01">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a2" style="endArrow=none;html=1;strokeColor=#F57C00;strokeWidth=1;" edge="1" parent="1" source="A1" target="U03">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a3" style="endArrow=none;html=1;strokeColor=#F57C00;strokeWidth=1;" edge="1" parent="1" source="A1" target="U14">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a4" style="endArrow=none;html=1;strokeColor=#F57C00;strokeWidth=1;" edge="1" parent="1" source="A1" target="U04">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="a5" style="endArrow=none;html=1;strokeColor=#F57C00;strokeWidth=1;" edge="1" parent="1" source="A1" target="U20">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="c1" style="endArrow=none;html=1;strokeColor=#7B1FA2;strokeWidth=1;" edge="1" parent="1" source="A2" target="U01">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="c2" style="endArrow=none;html=1;strokeColor=#7B1FA2;strokeWidth=1;" edge="1" parent="1" source="A2" target="U02">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="d1" style="endArrow=none;html=1;strokeColor=#7B1FA2;strokeWidth=1;" edge="1" parent="1" source="A3" target="U03">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="d2" style="endArrow=none;html=1;strokeColor=#7B1FA2;strokeWidth=1;" edge="1" parent="1" source="A3" target="U06">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="d3" style="endArrow=none;html=1;strokeColor=#7B1FA2;strokeWidth=1;" edge="1" parent="1" source="A3" target="U05">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="d4" style="endArrow=none;html=1;strokeColor=#7B1FA2;strokeWidth=1;" edge="1" parent="1" source="A3" target="U17">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="d5" style="endArrow=none;html=1;strokeColor=#7B1FA2;strokeWidth=1;" edge="1" parent="1" source="A3" target="U20">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="f1" style="endArrow=none;html=1;strokeColor=#00796B;strokeWidth=1;" edge="1" parent="1" source="A6" target="U03">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="f2" style="endArrow=none;html=1;strokeColor=#00796B;strokeWidth=1;" edge="1" parent="1" source="A6" target="U05">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="r1" value="&lt;&lt;include&gt;&gt;" style="endArrow=open;endFill=0;dashed=1;html=1;strokeColor=#546E7A;strokeWidth=1;fontSize=10;fontColor=#37474F;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="U01" target="U02">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="r2" value="&lt;&lt;include&gt;&gt;" style="endArrow=open;endFill=0;dashed=1;html=1;strokeColor=#546E7A;strokeWidth=1;fontSize=10;fontColor=#37474F;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="U01" target="U06">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="r3" value="&lt;&lt;include&gt;&gt;" style="endArrow=open;endFill=0;dashed=1;html=1;strokeColor=#546E7A;strokeWidth=1;fontSize=10;fontColor=#37474F;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="U03" target="U17">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="r4" value="&lt;&lt;extend&gt;&gt;" style="endArrow=open;endFill=0;dashed=1;html=1;strokeColor=#546E7A;strokeWidth=1;fontSize=10;fontColor=#37474F;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="U03" target="U05">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="r5" value="&lt;&lt;extend&gt;&gt;" style="endArrow=open;endFill=0;dashed=1;html=1;strokeColor=#546E7A;strokeWidth=1;fontSize=10;fontColor=#37474F;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="U14" target="U01">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="r6" value="&lt;&lt;include&gt;&gt;" style="endArrow=open;endFill=0;dashed=1;html=1;strokeColor=#546E7A;strokeWidth=1;fontSize=10;fontColor=#37474F;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="U06" target="U03">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="r7" value="&lt;&lt;include&gt;&gt;" style="endArrow=open;endFill=0;dashed=1;html=1;strokeColor=#546E7A;strokeWidth=1;fontSize=10;fontColor=#37474F;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="U20" target="U03">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="legend" value="图例：橙色=主要参与者　紫色=系统类次要参与者　青色=资源类次要参与者　绿色=核心用例　橙色椭圆=系统支撑用例　虚线箭头=include / extend 关系" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#546E7A;" vertex="1" parent="1">
+          <mxGeometry x="60" y="990" width="1160" height="24" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
