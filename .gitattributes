@@ -1,0 +1,30 @@
+# Git 属性配置
+#
+# 【重要】.bat / .cmd 必须强制使用 CRLF 换行。
+#
+# 原因：cmd.exe 不认孤立的 LF（0x0A）行尾。批处理文件里只要含中文这类
+# 多字节字符，cmd 就会判断错行尾，把下一行"粘"到上一行上——
+# 结果是 python 启动命令被当成上一条命令的参数吞掉，
+# 表现为"双击启动器，黑窗口一闪就没了，程序没起来"。
+#
+# 本项目的 启动剪贴板Pro.bat 就踩过这个坑。声明 eol=crlf 之后，
+# 无论在什么平台上 checkout，这个文件都会保持 Windows 换行。
+#
+# 另外 run_tests.py 每次都会执行 tests/check_launchers.py 做兜底检查。
+
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.py   text eol=lf
+*.sql  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+
+# 图片附件与二进制资料不做行尾转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.db  binary
