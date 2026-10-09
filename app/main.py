@@ -81,6 +81,7 @@ _harden_streams()
 from app import APP_NAME, VERSION                      # noqa: E402
 from app.app.kernel import Kernel                      # noqa: E402
 from app.errors import AppError                        # noqa: E402
+from app.infrastructure import paths                   # noqa: E402
 from app.infrastructure import single_instance         # noqa: E402
 from app.infrastructure.clipboard import win32 as w32  # noqa: E402
 from app.ui.panel import MainPanel                     # noqa: E402
@@ -131,6 +132,12 @@ class Application(object):
         if not self.silent_start:
             self.panel.show(focus_search=True)
 
+        # 把"三种根"记进日志。打包之后路径算错是本项目最容易踩的坑，
+        # 而且踩错了不会报错，只表现为"数据好像丢了""表情变成兜底表"。
+        # 写进日志之后，出问题让用户把 clipboardpro.log 发过来就能一眼定位。
+        self.logger.info("程序根：%s（打包形态：%s）",
+                         paths.program_root(), paths.is_frozen())
+        self.logger.info("资源根：%s", paths.bundle_root())
         self.logger.info("%s v%s 已就绪（数据目录：%s）", APP_NAME, VERSION, self.data_dir)
         try:
             self.root.mainloop()

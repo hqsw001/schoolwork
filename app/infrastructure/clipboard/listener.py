@@ -45,16 +45,26 @@ WM_RUN_COMMANDS = w32.WM_APP + 2
 # 托盘图标 uID
 TRAY_UID = 1
 
-#: 快捷键动作名（与配置项 app.main_hotkey / app.search_hotkey 对应）
+#: 快捷键动作名（与配置项 app.main_hotkey / app.search_hotkey / app.sequential_hotkey 对应）
 ACTION_MAIN_PANEL = "main_panel"
 ACTION_SEARCH = "search"
 ACTION_TOGGLE_LISTEN = "toggle_listen"
+#: 顺序粘贴：按一次粘一条队列里的记录（默认 Alt+V，按住 Alt 连按 V）
+ACTION_SEQUENTIAL = "sequential"
+#: 带格式粘贴：不开面板，直接把最新一条**带格式**粘到当前窗口（默认 Ctrl+Shift+Z）
+ACTION_RICH_PASTE = "rich_paste"
 
 HOTKEY_IDS = {
     ACTION_MAIN_PANEL: 1,
     ACTION_SEARCH: 2,
     ACTION_TOGGLE_LISTEN: 3,
+    ACTION_SEQUENTIAL: 4,
+    ACTION_RICH_PASTE: 5,
 }
+
+#: 占用探测专用的热键 id：与上面三个分开，探测完立刻注销，
+#: 不会把用户正在用的快捷键挤掉。
+PROBE_HOTKEY_ID = 0x7FFE
 
 #: 每个动作的候选快捷键（第一个就是配置里的默认值）。
 #: 为什么要一串候选：RegisterHotKey 是**先到先得**的，而 Ctrl+Shift+V
@@ -70,6 +80,18 @@ HOTKEY_CANDIDATES = {
     ACTION_SEARCH: (
         "Ctrl+Shift+F", "Ctrl+Shift+S", "Ctrl+Alt+F", "Ctrl+Shift+F8",
         "Ctrl+Alt+D", "Ctrl+F9",
+    ),
+    # 顺序粘贴默认 Alt+V（TieZ 同款）：按住 Alt 连按 V 就能一条条粘。
+    # 被占用时退到 Ctrl+Alt+数字——这个组合几乎不会和别人撞。
+    ACTION_SEQUENTIAL: (
+        "Alt+V", "Ctrl+Alt+1", "Ctrl+Alt+2", "Ctrl+Shift+Alt+V", "Ctrl+Alt+F11",
+    ),
+    # 带格式粘贴默认 Ctrl+Shift+Z（与参考实现一致）。
+    # ⚠ 这个组合在 Photoshop / VS Code 里是"重做"，全局注册会把它抢走——
+    # 所以备选键要够多，用户也可以自己在设置里改。
+    ACTION_RICH_PASTE: (
+        "Ctrl+Shift+Z", "Ctrl+Alt+Z", "Ctrl+Shift+Alt+Z", "Ctrl+Alt+F12",
+        "Ctrl+Shift+F12",
     ),
 }
 
@@ -444,6 +466,10 @@ class ClipboardListener(object):
             try:
                 if command == "__tooltip__":
                     self._update_tray_tooltip_on_thread(accelerator)
+                elif command == "__balloon__":
+                    self._show_balloon_on_thread(action, accelerator)
+                elif command == "__probe__":
+                    self._probe_hotkey_on_thread(action)
                 elif command == "set":
                     # 用户主动在设置里改的快捷键：只认这一个，
                     # **不做候选降级** —— 用户明确要这个键，
@@ -472,9 +498,76 @@ class ClipboardListener(object):
                     self._substituted.clear()
                     self._failed.clear()
                     self._register_all_hotkeys_on_thread()
+                elif command == "recording":
+                    if accelerator:
+                        # 开始录制：把全部快捷键让出去，否则想录的组合
+                        # 会被 Windows 截走，录制永远收不到那个按键。
+                        # 注意 _unregister_* 只动 _registered/_effective，
+                        # **不会清 _hotkeys**，所以这里不需要备份期望状态。
+                        self._unregister_all_hotkeys_on_thread()
+                    else:
+                        # 录制结束：按 _hotkeys 重新注册。
+                        # **不要从"录制前的快照"恢复** —— 用户完全可能在
+                        # 录制期间改过快捷键，用旧快照会把那次修改吞掉。
+                        self._substituted.clear()
+                        self._failed.clear()
+                        self._register_all_hotkeys_on_thread()
             except Exception as exc:  # noqa: BLE001
                 if self.logger:
                     self.logger.warning("处理快捷键命令失败：%s", exc)
+
+    def probe_hotkey(self, accelerator, modifiers, vk, timeout=2.0):
+        """探测某个组合能否注册（在消息线程上试注册后立刻注销）。
+
+        设置界面在保存前调用，提前告诉用户"这个键被占了"，
+        而不是等保存完才发现按了没反应。
+        """
+        if not self._hwnd:
+            return {"available": False, "reason": "监听窗口未就绪"}
+        # 如果这个组合正是我们自己已经注册着的，那它当然"可用"。
+        # 不判断的话会误报"被其他程序占用"——RegisterHotKey 是先到先得，
+        # 我们自己的注册也会占住这个组合，用户想把它设成原样就会看到假报错。
+        normalized = (accelerator or "").replace(" ", "").lower()
+        for current in self._effective.values():
+            if (current or "").replace(" ", "").lower() == normalized:
+                return {"available": True, "reason": "", "accelerator": accelerator,
+                        "ownedByUs": True}
+        event = threading.Event()
+        box = {}
+        self._pending_hotkey_commands.put(
+            ("__probe__", (accelerator, modifiers, vk, box, event), None))
+        self._wake()
+        if not event.wait(timeout):
+            return {"available": False, "reason": "探测超时（消息线程没有响应）"}
+        return {"available": bool(box.get("available")),
+                "reason": box.get("reason", ""),
+                "accelerator": accelerator}
+
+    def _probe_hotkey_on_thread(self, payload):
+        """消息线程上的探测实现：注册 → 立刻注销。"""
+        accelerator, modifiers, vk, box, event = payload
+        try:
+            if not self._hwnd:
+                box["available"] = False
+                box["reason"] = "监听窗口未就绪"
+                return
+            handle = wt.HWND(self._hwnd)
+            # 先确保这个探测 id 是干净的，否则 RegisterHotKey 会因 id 冲突失败
+            w32.user32.UnregisterHotKey(handle, PROBE_HOTKEY_ID)
+            ok = bool(w32.user32.RegisterHotKey(
+                handle, PROBE_HOTKEY_ID, modifiers | w32.MOD_NOREPEAT, vk))
+            if ok:
+                w32.user32.UnregisterHotKey(handle, PROBE_HOTKEY_ID)
+                box["available"] = True
+                box["reason"] = ""
+            else:
+                box["available"] = False
+                box["reason"] = "该快捷键已被其他程序占用"
+        except Exception as exc:  # noqa: BLE001
+            box["available"] = False
+            box["reason"] = "探测失败：%s" % exc
+        finally:
+            event.set()
 
     def _register_exact(self, action, accelerator):
         """只注册指定的这一个组合，不做候选降级。"""
@@ -512,9 +605,30 @@ class ClipboardListener(object):
         self._pending_hotkey_commands.put(("reapply", None, dict(hotkeys or {})))
         self._wake()
 
+    def set_recording_mode(self, enabled):
+        """录制快捷键期间**临时注销全部全局快捷键**（对应 TieZ 的 set_recording_mode）。
+
+        为什么必须这么做：一旦某个组合被 ``RegisterHotKey`` 注册，
+        Windows 会**先把它截走**，我们的窗口根本收不到那个按键。
+        于是"想录一个当前已注册的快捷键"就永远录不上——用户只会觉得
+        录制功能坏了。录完必须立刻恢复，否则这段时间按快捷键没反应。
+        """
+        self._pending_hotkey_commands.put(("recording", None, bool(enabled)))
+        self._wake()
+
     def update_tray_tooltip(self, text):
         self._tray_tooltip = text
         self._pending_hotkey_commands.put(("__tooltip__", None, text))
+        self._wake()
+
+    def show_balloon(self, title, body, level="info"):
+        """弹一个系统托盘气泡通知（在消息线程上执行）。
+
+        比面板内的 toast 更容易被看到——窗口收起时 toast 是看不见的。
+        """
+        icon = {"info": w32.NIIF_INFO, "warning": w32.NIIF_WARNING,
+                "error": w32.NIIF_ERROR}.get(level, w32.NIIF_INFO)
+        self._pending_hotkey_commands.put(("__balloon__", (title, body, icon), None))
         self._wake()
 
     # ---------------------------------------------------------- 托盘
@@ -553,6 +667,23 @@ class ClipboardListener(object):
             w32.shell32.Shell_NotifyIconW(w32.NIM_MODIFY, ctypes.byref(data))
         except Exception:  # noqa: BLE001
             pass
+
+    def _show_balloon_on_thread(self, payload, _unused=None):
+        """用托盘图标弹气泡（NIF_INFO 走 NIM_MODIFY）。"""
+        if not self._tray_added or not self._hwnd:
+            return False
+        try:
+            title, body, icon = payload
+            data = self._build_notify_data(w32.NIF_INFO)
+            data.szInfoTitle = str(title or "")[:63]
+            data.szInfo = str(body or "")[:255]
+            data.dwInfoFlags = icon
+            return bool(w32.shell32.Shell_NotifyIconW(
+                w32.NIM_MODIFY, ctypes.byref(data)))
+        except Exception as exc:  # noqa: BLE001 - 通知失败不影响任何主流程
+            if self.logger:
+                self.logger.warning("气泡通知失败：%s", exc)
+            return False
 
     def _remove_tray_icon_on_thread(self):
         if not self._tray_added or not self._hwnd:

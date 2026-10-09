@@ -18,6 +18,7 @@ import hashlib
 import re
 import unicodedata
 
+from app.infrastructure.clipboard import rich_text
 from app.constants import (
     TYPE_CODE,
     TYPE_FILE,
@@ -25,6 +26,8 @@ from app.constants import (
     TYPE_RICH_TEXT,
     TYPE_TEXT,
     TYPE_URL,
+    TYPE_VIDEO,
+    looks_like_video,
 )
 
 # ---------------------------------------------------------------------------
@@ -138,8 +141,10 @@ def detect_content_type(data):
         content = "\n".join(data.files or [])
         if not data.files:
             return None, None, None
-        if len(data.files) == 1 and looks_like_url(data.files[0]):
-            return TYPE_FILE, content, None
+        # 视频单独成一类：存储形态与文件一样（路径列表），
+        # 但界面要显示视频图标、按"视频"筛选
+        if looks_like_video(data.files):
+            return TYPE_VIDEO, content, None
         return TYPE_FILE, content, None
     if kind == "rich_text":
         html = data.html or ""
@@ -226,6 +231,9 @@ def strip_html(html):
     """
     if not html:
         return ""
+    # 附加格式标记（命名格式 / 位图回退）是给"粘回去"用的，里面是 base64，
+    # 绝不能出现在预览或降级正文里——必须先摘掉再提纯文本。
+    html = rich_text.strip_markers(html)
     text = _SCRIPT_RE.sub("", html)
     text = _BR_RE.sub("\n", text)
     text = _BLOCK_RE.sub("\n", text)

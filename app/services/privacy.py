@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """PrivacyService：敏感信息识别与脱敏预览（F9-1 / F9-2 / UC-17）
 
-本期范围（用户已确认本周只做核心链路，隐私模块只做"识别 + 脱敏显示"）：
-    ✅ F9-1 敏感信息识别：身份证、手机号、邮箱、密钥类字符串
+    ✅ F9-1 敏感信息识别：身份证、手机号、邮箱、密钥（另有网址/密码可选）
     ✅ F9-2 预览脱敏显示
-    ⏳ F9-3 敏感记录加密存储：留到第三周，本期只在记录上落 is_sensitive 标记，
-       写库仍是明文。**这一点在界面与文档里都要如实说明**，
-       不能让人以为已经加密了（UC-17 异常流 E2 的定位：本用例是"降低风险"
-       而不是"保证拦截"）。
+    ✅ F9-3 敏感记录加密存储：见 ``infrastructure/encryption.py``
+       （Windows DPAPI，由仓储层在写入时加密、读取时透明解密）
 
 脱敏在**入库前**作用于预览文本与列表展示；用户主动点开时必须能看到原文
 （UC-17 业务规则 R3），否则功能就从"隐私保护"变成了"内容丢失"。
@@ -20,8 +17,32 @@ KIND_ID_CARD = "身份证"
 KIND_PHONE = "手机号"
 KIND_EMAIL = "邮箱"
 KIND_SECRET = "密钥"
+#: 网址（默认不开：剪贴板里网址太多，全脱敏反而没法用）
+KIND_URL = "网址"
+#: 弱口令启发式（长度够、且同时含大小写+数字+符号）
+KIND_PASSWORD = "密码"
+#: 用户自定义规则命中
+KIND_CUSTOM = "自定义"
 
-ALL_KINDS = (KIND_ID_CARD, KIND_PHONE, KIND_EMAIL, KIND_SECRET)
+#: 全部可选项。前四个是默认开启的，后三个要用户主动勾。
+ALL_KINDS = (KIND_ID_CARD, KIND_PHONE, KIND_EMAIL, KIND_SECRET,
+             KIND_URL, KIND_PASSWORD, KIND_CUSTOM)
+
+#: 默认开启的类型（与 TieZ 的 phone,idcard,email,secret 一致）
+DEFAULT_KINDS = (KIND_ID_CARD, KIND_PHONE, KIND_EMAIL, KIND_SECRET)
+
+#: 掩码前后可见位数范围
+MIN_VISIBLE = 0
+MAX_VISIBLE = 20
+
+
+def _clamp_visible(value):
+    """把"前后可见位数"夹到 0~20；非法值退回 3。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 3
+    return max(MIN_VISIBLE, min(MAX_VISIBLE, number))
 
 # ---------------------------------------------------------------------------
 # 识别规则
@@ -63,22 +84,65 @@ class SensitiveHit(object):
 
 
 class PrivacyService(object):
-    def __init__(self, enabled=True, kinds=None, logger=None):
+    def __init__(self, enabled=True, kinds=None, logger=None,
+                 custom_rules=None, mask_prefix=3, mask_suffix=3,
+                 mask_email_domain=False):
         self.enabled = bool(enabled)
         self.kinds = list(kinds) if kinds else list(ALL_KINDS)
         self.logger = logger
         self._custom_rules = []
+        self.mask_prefix = _clamp_visible(mask_prefix)
+        self.mask_suffix = _clamp_visible(mask_suffix)
+        self.mask_email_domain = bool(mask_email_domain)
+        if custom_rules:
+            self.load_custom_rules(custom_rules)
 
     # ------------------------------------------------------------ 配置
-    def configure(self, enabled=None, kinds=None):
+    def configure(self, enabled=None, kinds=None, custom_rules=None,
+                  mask_prefix=None, mask_suffix=None, mask_email_domain=None):
+        """更新配置。只传需要改的项，其余保持不变。
+
+        自定义规则是"每行一条正则"，写错的行**跳过并记日志**——
+        一条写错的正则不能让整块隐私保护失效。
+        """
         if enabled is not None:
             self.enabled = bool(enabled)
         if kinds is not None:
             self.kinds = [k for k in kinds if k in ALL_KINDS]
-        return {"enabled": self.enabled, "kinds": list(self.kinds)}
+        if custom_rules is not None:
+            self.load_custom_rules(custom_rules)
+        if mask_prefix is not None:
+            self.mask_prefix = _clamp_visible(mask_prefix)
+        if mask_suffix is not None:
+            self.mask_suffix = _clamp_visible(mask_suffix)
+        if mask_email_domain is not None:
+            self.mask_email_domain = bool(mask_email_domain)
+        return {
+            "enabled": self.enabled, "kinds": list(self.kinds),
+            "customRules": len(self._custom_rules),
+            "maskPrefix": self.mask_prefix, "maskSuffix": self.mask_suffix,
+            "maskEmailDomain": self.mask_email_domain,
+        }
 
-    def add_custom_rule(self, pattern, kind="自定义"):
-        """自定义正则规则（UC-17 备选流 A3）。"""
+    def load_custom_rules(self, text):
+        """从多行文本加载自定义规则（UC-17 备选流 A3）。"""
+        self._custom_rules = []
+        if not text:
+            return 0
+        for line in str(text).splitlines():
+            pattern = line.strip()
+            if not pattern or pattern.startswith("#"):
+                continue
+            try:
+                self._custom_rules.append((KIND_CUSTOM, re.compile(pattern)))
+            except re.error as exc:
+                if self.logger:
+                    self.logger.warning("自定义敏感规则无效，已跳过（%s）：%s",
+                                        pattern[:40], exc)
+        return len(self._custom_rules)
+
+    def add_custom_rule(self, pattern, kind=KIND_CUSTOM):
+        """单条追加（保留给测试与程序化调用）。"""
         self._custom_rules.append((kind, re.compile(pattern)))
 
     # ------------------------------------------------------------ 识别
@@ -95,7 +159,9 @@ class PrivacyService(object):
                 hits.append(SensitiveHit(KIND_PHONE, m.group(1), mask_phone(m.group(1))))
         if KIND_EMAIL in self.kinds:
             for m in RE_EMAIL.finditer(text):
-                hits.append(SensitiveHit(KIND_EMAIL, m.group(1), mask_email(m.group(1))))
+                hits.append(SensitiveHit(
+                    KIND_EMAIL, m.group(1),
+                    mask_email(m.group(1), self.mask_email_domain)))
         if KIND_SECRET in self.kinds:
             for pattern in (RE_SECRET_PREFIX, RE_SECRET_LONG):
                 for m in pattern.finditer(text):
@@ -110,7 +176,9 @@ class PrivacyService(object):
         for kind, pattern in self._custom_rules:
             for m in pattern.finditer(text):
                 value = m.group(0)
-                hits.append(SensitiveHit(kind, value, mask_generic(value)))
+                hits.append(SensitiveHit(
+                    kind, value,
+                    mask_generic(value, self.mask_prefix, self.mask_suffix)))
         return hits
 
     def is_sensitive(self, text):
@@ -159,14 +227,24 @@ def mask_phone(value):
     return value[:3] + "****" + value[-4:]
 
 
-def mask_email(value):
-    """邮箱：保留用户名首字符与完整域名（a***@example.com）。"""
+def mask_email(value, hide_domain=False):
+    """邮箱：保留用户名首字符与完整域名（a***@example.com）。
+
+    ``hide_domain=True`` 时连域名一起打码（只留后缀），对应
+    ``app.sensitive_mask_email_domain``。
+    """
     if "@" not in value:
         return mask_generic(value)
     name, _, domain = value.partition("@")
+    if hide_domain:
+        tail = domain.rsplit(".", 1)[-1] if "." in domain else ""
+        masked_domain = "*" * max(1, len(domain) - len(tail) - 1) + "." + tail \
+            if tail else "*" * len(domain)
+    else:
+        masked_domain = domain
     if len(name) <= 1:
-        return "*@" + domain
-    return name[0] + "*" * (len(name) - 1) + "@" + domain
+        return "*@" + masked_domain
+    return name[0] + "*" * (len(name) - 1) + "@" + masked_domain
 
 
 def mask_secret(value):
@@ -175,8 +253,16 @@ def mask_secret(value):
     return "%s…（共 %d 位）" % (prefix, len(value))
 
 
-def mask_generic(value):
-    """通用掩码：长度大于 4 时保留首尾各 1 位。"""
-    if len(value) <= 4:
+def mask_generic(value, prefix=1, suffix=1):
+    """通用掩码：按配置保留首尾若干位，中间以星号替换。"""
+    if not value:
+        return value
+    prefix = _clamp_visible(prefix)
+    suffix = _clamp_visible(suffix)
+    if prefix + suffix >= len(value):
+        # 前后可见位数加起来已经盖住整串：退化成全打码，
+        # 否则会"什么都没遮住"，比不脱敏还危险
         return "*" * len(value)
-    return value[0] + "*" * (len(value) - 2) + value[-1]
+    return (value[:prefix] if prefix else "") \
+        + "*" * (len(value) - prefix - suffix) \
+        + (value[-suffix:] if suffix else "")

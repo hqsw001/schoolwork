@@ -67,6 +67,10 @@ def fail(code=ERR_INTERNAL, message=None):
     }
 
 
+#: 标准信封的键集合。用于识别"这已经是一个包装好的返回结构"。
+_ENVELOPE_KEYS = frozenset(("ok", "data", "error", "timestamp"))
+
+
 def guard(func):
     """命令方法装饰器：把 AppError 与未预期异常统一收敛成返回结构。
 
@@ -75,15 +79,24 @@ def guard(func):
         @guard
         def get_history(self, limit=50, offset=0):
             ...
+
+    注意：命令内部**可以**直接调用另一个 @guard 命令（``copy_entry`` 转发到
+    ``paste_entry`` 就是这种写法）。这时内层已经返回过标准信封了，外层不能
+    再包一层——否则调用方拿到的是
+    ``{"ok":true,"data":{"ok":true,"data":{...}}}``，得剥两层才能用。
+    所以这里先判断返回值是不是已经是信封。
     """
 
     def wrapper(*args, **kwargs):
         try:
-            return ok(func(*args, **kwargs))
+            result = func(*args, **kwargs)
         except AppError as exc:
             return fail(exc.code, exc.message)
         except Exception as exc:  # noqa: BLE001 - 兜底，避免界面因异常白屏
             return fail(ERR_INTERNAL, "内部错误：%s" % exc)
+        if isinstance(result, dict) and frozenset(result.keys()) == _ENVELOPE_KEYS:
+            return result
+        return ok(result)
 
     wrapper.__name__ = func.__name__
     wrapper.__doc__ = func.__doc__

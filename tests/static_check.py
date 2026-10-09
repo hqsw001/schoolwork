@@ -5,8 +5,18 @@
 与 ``K_LIST_DENSITY`` 两处"忘记导入"。它们都属于"只在某条分支上才炸"的
 问题：单元测试不覆盖那条分支就发现不了，但用户一用就会看到"内部错误"。
 
-实现方式：带作用域栈的 AST 遍历（而不是简单地收集所有字符串常量——
-那样会把字典键、提示文案全当成名字，产生上千条噪音）。
+⚠ 2026-09 修订：这个检查器本身出过一个严重的漏报，导致第三个同类缺陷
+（``panel.py`` 里 ``SettingsWindow`` 未导入）一路通过回归、直到用户现场
+报障"设置打不开"才被发现。原因是 ``report()`` 在**遍历结束之后**才去读
+作用域栈，那时所有函数作用域都已经出栈，只剩模块作用域 ——
+也就是说**函数体里的未定义名字一个都没检查过**。
+
+现在的做法：
+    1. 先做一遍"预扫描"，把模块级/类级绑定的名字全部收集起来
+       （见 ``ModuleDefinitionCollector``）。必须先扫完再判定，否则
+       ``def f(): return LATER`` 这种合法前向引用会被误报。
+    2. 再带作用域栈遍历，并且**在作用域出栈的那一刻**就记下未定义名字，
+       而不是等遍历结束再回头找。
 
 用法：
     python -m tests.static_check
@@ -16,6 +26,7 @@ import ast
 import builtins
 import os
 import sys
+import tempfile
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_DIR = os.path.join(PROJECT_ROOT, "app")
@@ -32,9 +43,58 @@ IGNORED_NAMES = {
 }
 
 
+class ModuleDefinitionCollector(ast.NodeVisitor):
+    """收集模块级与类级绑定的名字（**不进入函数体**）。
+
+    只收模块级/类级，不收函数内部的局部变量——局部名在别的函数里
+    是不可见的，收了会把真问题掩盖掉。
+    """
+
+    def __init__(self):
+        self.names = set()
+
+    # ---- 不进函数体：函数名本身算定义，但函数内部的赋值不算
+    def visit_FunctionDef(self, node):
+        self.names.add(node.name)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Lambda(self, node):
+        return
+
+    # ---- 类体要进：类属性与方法名对模块级代码是可见的
+    def visit_ClassDef(self, node):
+        self.names.add(node.name)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.names.add(alias.asname or alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node):
+        for alias in node.names:
+            if alias.name != "*":
+                self.names.add(alias.asname or alias.name)
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_Global(self, node):
+        self.names.update(node.names)
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.names.add(node.name)
+        for statement in node.body:
+            self.visit(statement)
+
+
 class Scope(object):
-    def __init__(self, kind):
+    def __init__(self, kind, name=""):
         self.kind = kind          # module / function / class / comprehension
+        self.name = name
         self.names = set()
         self.loads = set()
 
@@ -47,11 +107,16 @@ class Analyzer(ast.NodeVisitor):
         - for / with / 推导式的目标算"定义"；
         - ``ast.Name`` 的 Load 上下文算"使用"，Attr 的属性名不算；
         - 查名字时从内层往外层找，最后查内置名字。
+
+    未定义的名字在**作用域出栈时**立刻记录，避免遍历结束后作用域已丢失。
     """
 
-    def __init__(self, module_name="<module>"):
+    def __init__(self, module_name="<module>", predefinitions=None):
         self.module_name = module_name
-        self.stack = [Scope("module")]
+        self.stack = [Scope("module", module_name)]
+        if predefinitions:
+            # 模块级/类级定义先灌进来，避免把合法前向引用误报为未定义
+            self.stack[0].names |= set(predefinitions)
         self.imports = set()
         self.problems = []
 
@@ -75,6 +140,18 @@ class Analyzer(ast.NodeVisitor):
                 return True
         return name in dir(builtins)
 
+    # ------------------------------------------------------------ 作用域栈
+    def _push(self, kind, name=""):
+        self.stack.append(Scope(kind, name))
+
+    def _pop(self):
+        """出栈并记录该作用域里没能解析的名字（关键：不能等到最后再收）。"""
+        scope = self.stack.pop()
+        if scope.loads:
+            label = "%s %s" % (scope.kind, scope.name) if scope.name else scope.kind
+            self.problems.append((label, sorted(scope.loads)))
+        return scope
+
     # ------------------------------------------------------------ 作用域
     def _visit_function(self, node):
         # 函数名在外层定义；装饰器、默认值、注解都在外层求值
@@ -87,11 +164,11 @@ class Analyzer(ast.NodeVisitor):
         for annotation in self._iter_annotations(args, node.returns):
             self.visit(annotation)
 
-        self.stack.append(Scope("function"))
+        self._push("function", node.name)
         self._bind_arguments(args)
         for statement in node.body:
             self.visit(statement)
-        self.stack.pop()
+        self._pop()
 
     def _iter_annotations(self, args, returns):
         collected = []
@@ -122,10 +199,10 @@ class Analyzer(ast.NodeVisitor):
     def visit_Lambda(self, node):
         for default in list(node.args.defaults) + [d for d in node.args.kw_defaults if d]:
             self.visit(default)
-        self.stack.append(Scope("function"))
+        self._push("lambda", "<lambda>")
         self._bind_arguments(node.args)
         self.visit(node.body)
-        self.stack.pop()
+        self._pop()
 
     def visit_ClassDef(self, node):
         self.define(node.name)
@@ -133,10 +210,10 @@ class Analyzer(ast.NodeVisitor):
             self.visit(decorator)
         for base in node.bases:
             self.visit(base)
-        self.stack.append(Scope("class"))
+        self._push("class", node.name)
         for statement in node.body:
             self.visit(statement)
-        self.stack.pop()
+        self._pop()
 
     def visit_comprehension(self, node):
         self.define_target(node.target)
@@ -145,7 +222,7 @@ class Analyzer(ast.NodeVisitor):
             self.visit(condition)
 
     def _visit_comprehension_scope(self, node):
-        self.stack.append(Scope("comprehension"))
+        self._push("comprehension")
         for generator in node.generators:
             self.visit_comprehension(generator)
         if isinstance(node, ast.DictComp):
@@ -153,7 +230,7 @@ class Analyzer(ast.NodeVisitor):
             self.visit(node.value)
         else:
             self.visit(node.elt)
-        self.stack.pop()
+        self._pop()
 
     def visit_ListComp(self, node):
         self._visit_comprehension_scope(node)
@@ -243,11 +320,15 @@ class Analyzer(ast.NodeVisitor):
 
     # ------------------------------------------------------------ 汇总
     def report(self):
-        """返回 [(作用域名, 未定义名字)]。"""
-        out = []
-        for scope in self.stack:
-            if scope.loads:
-                out.append((scope.kind, sorted(scope.loads)))
+        """返回 [(作用域名, 未定义名字)]。
+
+        注意：这些是在 ``_pop()`` 里逐层攒下来的，不是现在才去栈里翻——
+        遍历结束时栈里只剩模块作用域，函数体的问题早就丢了。
+        """
+        out = list(self.problems)
+        module_scope = self.stack[0] if self.stack else None
+        if module_scope is not None and module_scope.loads:
+            out.append(("module %s" % self.module_name, sorted(module_scope.loads)))
         return out
 
 
@@ -256,7 +337,13 @@ def check_module(path):
         source = fh.read()
     tree = ast.parse(source, filename=path)
 
-    analyzer = Analyzer()
+    # 第一遍：收集模块级 / 类级定义
+    collector = ModuleDefinitionCollector()
+    collector.visit(tree)
+
+    # 第二遍：带作用域栈做名字解析
+    analyzer = Analyzer(module_name=os.path.basename(path),
+                        predefinitions=collector.names)
     analyzer.visit(tree)
     undefined = analyzer.report()
 
@@ -285,7 +372,86 @@ def iter_python_files(root):
                 yield os.path.join(dirpath, name)
 
 
+#: 检查器自检用例：(名字, 源码, 期望抓到的未定义名字集合)
+SELFTEST_CASES = [
+    # 就是让检查器漏报过一次的那个形状：函数体里用了没导入的类
+    ("function_body_nameerror",
+     "class P(object):\n"
+     "    def go(self):\n"
+     "        Missing(self)\n",
+     {"Missing"}),
+    ("local_typo",
+     "def f():\n"
+     "    x = 1\n"
+     "    return x + typo_here\n",
+     {"typo_here"}),
+    # 下面是**必须不报**的：报了就是误伤
+    ("forward_reference_ok",
+     "def f():\n"
+     "    return LATER\n"
+     "LATER = 1\n",
+     set()),
+    ("global_ok",
+     "N = 0\n"
+     "def f():\n"
+     "    global N\n"
+     "    N += 1\n",
+     set()),
+    ("builtin_and_import_ok",
+     "import os\n"
+     "def f(p):\n"
+     "    return len(os.path.basename(p))\n",
+     set()),
+    ("class_attr_ok",
+     "class C(object):\n"
+     "    LIMIT = 5\n"
+     "    def go(self):\n"
+     "        return LIMIT\n",
+     set()),
+]
+
+
+def selftest():
+    """让检查器验一遍自己，返回失败说明列表。
+
+    之所以要有这个自检：检查器本身出过一次**严重漏报** —— report() 在
+    遍历结束之后才去读作用域栈，那时函数作用域早已出栈，于是"函数体里
+    用了未导入的名字"这一类问题一个都没检查过。panel.py 里
+    SettingsWindow 未导入、设置窗口三个入口全部 NameError 的缺陷，
+    就是这样一路通过了回归。现在每次运行都先证明它抓得到这类问题。
+    """
+    failures = []
+    for name, source, expected in SELFTEST_CASES:
+        path = os.path.join(tempfile.gettempdir(), "_static_selftest_%s.py" % name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(source)
+        try:
+            undefined, _unused = check_module(path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        found = set()
+        for _scope, names in undefined:
+            found.update(names)
+        if found != expected:
+            failures.append("%s：期望 %s，实际 %s"
+                            % (name, sorted(expected) or "无", sorted(found) or "无"))
+    return failures
+
+
 def main():
+    print("--- 检查器自检 ---")
+    selftest_failures = selftest()
+    if selftest_failures:
+        print("检查器自检失败，说明它已经抓不到本该抓到的问题：")
+        for item in selftest_failures:
+            print("    - %s" % item)
+        return 1
+    print("检查器自检通过（%d 个用例，该报的报、不该报的不报）\n"
+          % len(SELFTEST_CASES))
+
     problems = 0
     for path in sorted(iter_python_files(APP_DIR)):
         relative = os.path.relpath(path, PROJECT_ROOT)
@@ -296,7 +462,7 @@ def main():
             problems += 1
             continue
         for scope, names in undefined:
-            print("[疑似未定义] %s（%s 作用域）" % (relative, scope))
+            print("[疑似未定义] %s（%s）" % (relative, scope))
             for name in names:
                 print("    - %s" % name)
             problems += len(names)

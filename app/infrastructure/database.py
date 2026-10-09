@@ -13,9 +13,12 @@ import threading
 
 from app.errors import AppError
 from app.constants import ERR_INTERNAL
+from app.infrastructure import paths
 
 #: 附件目录名（图片外置存储，F2-3）
 ATTACHMENT_DIR_NAME = "attachments"
+#: 缩略图缓存目录名（列表卡片用，见 infrastructure/thumbnails.py）
+THUMB_DIR_NAME = "thumbs"
 DB_FILE_NAME = "clipboardpro.db"
 
 
@@ -26,13 +29,16 @@ def default_data_dir():
     不使用 %APPDATA%，避免换机器/换目录后找不到自己的历史。
     可用环境变量 ``CLIPBOARDPRO_DATA_DIR`` 覆盖，便于测试与多实例。
     目录不存在则创建。
+
+    源码运行时"程序包同级"是项目根；**打包成 exe 之后是 exe 所在目录**
+    （见 ``infrastructure/paths.py``）—— 不能按 ``__file__`` 算，
+    那样数据会落进 ``_internal``，换目录或覆盖升级都会显得"数据丢了"。
     """
     override = os.environ.get("CLIPBOARDPRO_DATA_DIR")
     if override:
         data_dir = os.path.abspath(override)
     else:
-        app_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        data_dir = os.path.join(app_root, ".data")
+        data_dir = os.path.join(paths.program_root(), ".data")
     try:
         os.makedirs(data_dir, exist_ok=True)
         os.makedirs(os.path.join(data_dir, ATTACHMENT_DIR_NAME), exist_ok=True)
@@ -48,6 +54,8 @@ class Database(object):
         self.data_dir = data_dir or default_data_dir()
         self.attachment_dir = os.path.join(self.data_dir, ATTACHMENT_DIR_NAME)
         os.makedirs(self.attachment_dir, exist_ok=True)
+        # 缩略图缓存：按需创建，目录不存在时 thumbnails 模块会自己建
+        self.thumb_dir = os.path.join(self.data_dir, THUMB_DIR_NAME)
         self.db_path = db_path or os.path.join(self.data_dir, DB_FILE_NAME)
         self.write_lock = threading.RLock()
         self.conn = self._connect()

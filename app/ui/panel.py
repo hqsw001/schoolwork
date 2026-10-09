@@ -20,6 +20,7 @@
     F5           刷新列表
 """
 
+import colorsys
 import re
 import time
 import tkinter as tk
@@ -34,27 +35,40 @@ from app.constants import (
     EVT_THEME_CHANGED,
     EVT_TOAST,
     K_ALWAYS_ON_TOP,
+    K_ARROW_KEY_SELECTION,
+    K_EDGE_DOCKING,
     K_FOLLOW_MOUSE,
+    K_IGNORE_BLUR,
     K_LIST_DENSITY,
     K_MAIN_HOTKEY,
     K_THEME,
     K_THEME_MODE,
     K_WINDOW_GEOMETRY,
+    K_WINDOW_PINNED,
     PAGE_SIZE,
     TOAST_ERROR,
     TOAST_INFO,
     TOAST_SUCCESS,
     TOAST_WARNING,
+    TYPE_CODE,
     TYPE_IMAGE,
     TYPE_LABELS,
+    TYPE_TEXT,
     is_text_type,
 )
 from app.errors import now_ms
+from app.infrastructure import monitors as monitors_mod
+from app.services import window_behavior
 from app.ui import theme as theme_mod
 from app.ui.toast import Toast
 
 #: 一次渲染的最大条数（F4 虚拟滚动的简化实现：分批加载，不一次性建上千个控件）
 RENDER_BATCH = 60
+
+#: 整条内容就是一个颜色值时，卡片上直接画色块（#rgb / #rrggbb / #rrggbbaa /
+#: rgb() / rgba() / hsl() / hsla()）。限制长度避免把长文本误判成颜色。
+_COLOR_RE = re.compile(
+    r"^(#[0-9a-fA-F]{3,8}|rgba?\(\s*[\d.,%\s]+\)|hsla?\(\s*[\d.,%\s]+\))$")
 
 #: 检索防抖时长（UC-08 主事件流第 3 步：约 200 毫秒）
 SEARCH_DEBOUNCE_MS = 200
@@ -82,6 +96,11 @@ class MainPanel(object):
         self._rendered = 0
         self._selected_id = None
         self._card_map = {}
+        #: 缩略图 PhotoImage 的引用。**必须留引用**：tkinter 只持有弱引用，
+        #: 局部变量一出作用域图片就被回收，卡片上会变成一片空白。
+        self._thumb_refs = {}
+        #: 来源应用 / 文件类型小图标的 PhotoImage 引用（同缩略图，必须留引用）
+        self._icon_refs = {}
         self._counts = {}
         self._truncated = False
         self._render_batch_id = None
@@ -97,6 +116,10 @@ class MainPanel(object):
         self._visible = False
         self._hidden_at = 0.0
         self._menu = None
+        #: 服务端是否还有更旧的记录（分页游标用 len(self._entries)）
+        self._has_more = False
+        #: 正在取下一页，防止滚动回调把同一页请求发好几次
+        self._loading_more = False
 
         self._build_window()
         self._build_widgets()
@@ -138,6 +161,12 @@ class MainPanel(object):
         # 拖动或缩放结束后记下新位置（<Configure> 会在每次移动时触发，
         # 所以这里只做轻量的变量记录，真正写库在 hide() 里做一次）
         self.window.bind("<Configure>", self._on_window_configure)
+        # 失焦自动隐藏。放在 window 上而不是各个控件上：
+        # 控件层的 FocusOut 只在焦点离开该控件时触发，判断不出"离开整个面板"
+        self.window.bind("<FocusOut>", self._on_focus_out)
+        self._docked_edge = None
+        self._docking_in_progress = False
+        self._tracked_position = self._default_pos
 
     def _restore_geometry(self):
         """恢复上次的窗口大小（UC-16 窗口行为持久化）。
@@ -169,6 +198,181 @@ class MainPanel(object):
             return
         if event.width > 100 and event.height > 100:
             self._last_geometry = "%dx%d" % (event.width, event.height)
+        self._tracked_position = (event.x, event.y)
+        self._maybe_dock(event.x, event.y, event.width, event.height)
+
+    # ==================================================================
+    # 窗口行为：贴边停靠 / 失焦隐藏 / 跑出屏幕修复
+    # ==================================================================
+    def _monitors(self):
+        """当前的显示器列表（带短缓存，<Configure> 会被频繁触发）。"""
+        now = time.time()
+        cached = getattr(self, "_monitors_cache", None)
+        if cached and now - cached[0] < 5.0:
+            return cached[1]
+        monitors = monitors_mod.list_monitors()
+        self._monitors_cache = (now, monitors)
+        return monitors
+
+    def _current_monitor(self):
+        try:
+            x, y = self.window.winfo_x(), self.window.winfo_y()
+        except tk.TclError:
+            return None
+        return monitors_mod.monitor_from_point(x, y, self._monitors())
+
+    def _maybe_dock(self, x, y, width, height):
+        """拖到屏幕边缘时吸附过去。
+
+        **只在开启贴边停靠时生效**，而且停靠是"用户拖出来的"行为——
+        程序自己摆放窗口（跟随鼠标、跑出屏幕修复）时不动它。
+        """
+        if not self.kernel.settings.get(K_EDGE_DOCKING, False):
+            self._docked_edge = None
+            return
+        if self._docking_in_progress:
+            return
+        monitor = monitors_mod.monitor_from_point(x, y, self._monitors())
+        edge = window_behavior.nearest_edge(x, y, width, height, monitor)
+        if edge is None:
+            self._docked_edge = None
+            return
+        target = window_behavior.docked_position(edge, monitor, width, height)
+        if target is None:
+            return
+        self._docked_edge = edge
+        self._docked_monitor = monitor
+        self._apply_geometry(target[0], target[1], width, height)
+
+    def _apply_geometry(self, x, y, width, height):
+        """移动窗口，同时防止"移动触发 Configure、Configure 又触发移动"的死循环。"""
+        self._docking_in_progress = True
+        try:
+            self.window.geometry("%dx%d+%d+%d" % (width, height, int(x), int(y)))
+        except tk.TclError:
+            pass
+        finally:
+            # geometry() 的 Configure 是异步来的，留一点窗口期再解锁
+            self.window.after(60, self._release_docking_lock)
+
+    def _release_docking_lock(self):
+        self._docking_in_progress = False
+
+    def undock(self):
+        """把窗口从停靠状态展开回屏幕内。"""
+        if not getattr(self, "_docked_edge", None):
+            self._docked_edge = None
+            return False
+        monitor = getattr(self, "_docked_monitor", None) or self._current_monitor()
+        width, height = self._panel_size
+        target = window_behavior.expanded_position(self._docked_edge, monitor,
+                                                   width, height)
+        self._docked_edge = None
+        if target is None:
+            return False
+        self._apply_geometry(target[0], target[1], width, height)
+        return True
+
+    def _repair_position(self):
+        """跑出屏幕时把窗口挪回可见区域。
+
+        什么时候会跑出去：拔掉外接显示器、改了分辨率、或者上次在
+        副屏上退出。不修的话窗口就再也看不见了，用户只会认为"程序坏了"。
+        """
+        monitors = self._monitors()
+        if not monitors:
+            return False
+        try:
+            x, y = self.window.winfo_x(), self.window.winfo_y()
+        except tk.TclError:
+            return False
+        width, height = self._panel_size
+        new_x, new_y, repaired = window_behavior.clamp_to_screens(
+            x, y, width, height, monitors)
+        if repaired:
+            self.logger.info("窗口位置 %s,%s 不在任何显示器上，已修正为 %s,%s",
+                             x, y, new_x, new_y)
+            self._apply_geometry(new_x, new_y, width, height)
+        return repaired
+
+    def pinned(self):
+        """窗口是否处于"固定"状态。"""
+        return bool(self.kernel.settings.get(K_WINDOW_PINNED, False))
+
+    def set_pinned(self, pinned):
+        pinned = bool(pinned)
+        self.kernel.update_setting(K_WINDOW_PINNED, pinned)
+        self._apply_topmost()
+        self.toast.show("窗口已%s" % ("固定（始终置顶、失焦不隐藏）" if pinned
+                                     else "取消固定"), TOAST_INFO, 1800)
+        return pinned
+
+    def toggle_pinned(self):
+        return self.set_pinned(not self.pinned())
+
+    def _should_stay_on_blur(self):
+        """失焦时该不该留着面板。
+
+        窗口固定 > 忽略失焦 > 默认隐藏。固定时**连配置都不用改**，
+        因为它本身就是"我要它一直在"的表达。
+        """
+        if self.pinned():
+            return True
+        return bool(self.kernel.settings.get(K_IGNORE_BLUR, False))
+
+    def _apply_topmost(self):
+        try:
+            topmost = self.pinned() or bool(
+                self.kernel.settings.get(K_ALWAYS_ON_TOP))
+            self.window.attributes("-topmost", topmost)
+        except tk.TclError:
+            pass
+
+    def _on_focus_out(self, event):
+        """失焦自动隐藏（对应 TieZ 的 app.ignore_blur 抑制）。
+
+        两层过滤是必须的：
+
+        1. ``event.widget is not self.window`` —— 焦点在**面板内部**控件之间
+           移动也会触发 Toplevel 的 FocusOut，不过滤的话点一下搜索框面板就没了。
+        2. 打开子窗口（设置、标签管理、右键菜单）时也会失焦，
+           这些情况下同样不能隐藏。
+        """
+        if self._should_stay_on_blur():
+            return
+        # 已经最小化：最小化**本身**就会让窗口失焦，这里再 hide() 就变成
+        # 把它直接撤掉，"最小化"和"关闭"看起来毫无区别（本批次踩过）
+        try:
+            if self.window.state() != "normal":
+                return
+        except tk.TclError:
+            return
+        # 焦点只是移到了面板内部的控件上
+        try:
+            focused = self.window.focus_get()
+        except (tk.TclError, KeyError):
+            focused = None
+        if focused is not None and str(focused).startswith(str(self.window)):
+            return
+        if self._has_child_window():
+            return
+        self.hide()
+
+    def _has_child_window(self):
+        """当前是否开着属于本程序的子窗口（设置/标签管理/表情/对话框）。"""
+        try:
+            children = self.window.winfo_children()
+        except tk.TclError:
+            return False
+        for child in children:
+            if not isinstance(child, tk.Toplevel):
+                continue
+            try:
+                if child.winfo_exists() and child.winfo_viewable():
+                    return True
+            except tk.TclError:
+                continue
+        return False
 
     def _build_widgets(self):
         tokens = self._tokens
@@ -301,9 +505,42 @@ class MainPanel(object):
     # ==================================================================
     # 键盘与滚动
     # ==================================================================
+    #: 方向键选择涉及的按键序列
+    ARROW_SEQUENCES = ("<Up>", "<Down>", "<Prior>", "<Next>")
+
+    def _apply_arrow_key_setting(self):
+        """方向键是否参与列表选择（配置项 app.arrow_key_selection）。
+
+        关掉之后要**解绑**，不能只是"绑定后不响应"：留着空绑定照样会吃掉
+        按键事件，用户在搜索框里按上下键就没反应了。
+        """
+        for sequence in self.ARROW_SEQUENCES:
+            for widget in (self.window, self.search_entry):
+                try:
+                    widget.unbind(sequence)
+                except tk.TclError:
+                    pass
+        if not self.kernel.settings.get(K_ARROW_KEY_SELECTION, True):
+            return
+        self.window.bind("<Up>", lambda e: self._move_selection(-1))
+        self.window.bind("<Down>", lambda e: self._move_selection(1))
+        self.window.bind("<Prior>", lambda e: self._move_selection(-5))
+        self.window.bind("<Next>", lambda e: self._move_selection(5))
+        self.search_entry.bind("<Down>", lambda e: self._move_selection(1))
+        self.search_entry.bind("<Up>", lambda e: self._move_selection(-1))
+
+    def set_navigation_enabled(self, enabled):
+        """开/关方向键选择（对应命令 set_navigation_enabled）。"""
+        self.kernel.update_setting(K_ARROW_KEY_SELECTION, bool(enabled))
+        self._apply_arrow_key_setting()
+        return bool(enabled)
+
     def _bind_keys(self):
         # 面板自身按键
         self.window.bind("<Escape>", lambda e: self.hide())
+        # 预览浮窗是"看"的东西：一开始操作就让它让路
+        self._bind_preview_dismiss(self.window)
+        self._bind_preview_dismiss(self.canvas)
         self.window.bind("<F5>", lambda e: self.refresh())
         self.window.bind("<Delete>", lambda e: self._delete_selected())
         self.window.bind("<Control-p>", lambda e: self._toggle_pin_selected())
@@ -313,14 +550,12 @@ class MainPanel(object):
         self.window.bind("<Control-w>", lambda e: self.hide())
         self.window.bind("<Control-m>", lambda e: self.toggle_minimize())
         self.window.bind("<Control-comma>", lambda e: self.open_settings())
+        # Ctrl+↑/↓：在置顶区里挪动顺序（非置顶项会得到明确提示）
+        self.window.bind("<Control-Up>", lambda e: self.move_pinned_selected(-1))
+        self.window.bind("<Control-Down>", lambda e: self.move_pinned_selected(1))
         self.window.bind("<Return>", self._on_return)
         self.window.bind("<KP_Enter>", self._on_return)
-        self.window.bind("<Up>", lambda e: self._move_selection(-1))
-        self.window.bind("<Down>", lambda e: self._move_selection(1))
-        self.window.bind("<Prior>", lambda e: self._move_selection(-5))
-        self.window.bind("<Next>", lambda e: self._move_selection(5))
-        self.search_entry.bind("<Down>", lambda e: self._move_selection(1))
-        self.search_entry.bind("<Up>", lambda e: self._move_selection(-1))
+        self._apply_arrow_key_setting()
         self.search_entry.bind("<Return>", self._on_return)
         self.search_entry.bind("<Escape>", lambda e: self.hide())
         # Ctrl+1~9：直接粘贴第 N 条，熟练之后基本不用鼠标
@@ -333,6 +568,9 @@ class MainPanel(object):
     def _on_mousewheel(self, event):
         if not self._visible:
             return
+        # 一开始滚动就收起预览：浮窗挡在那儿既碍事，
+        # 滚动后卡片位置也变了，浮窗会指着错误的位置
+        self.hide_preview()
         try:
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         except tk.TclError:
@@ -346,8 +584,15 @@ class MainPanel(object):
         self.canvas.itemconfigure(self._list_window, width=event.width)
 
     def _maybe_render_more(self):
-        """滚动到接近底部时继续渲染下一批（列表分页渲染）。"""
+        """滚动到接近底部时继续渲染下一批（列表分页渲染）。
+
+        如果已经把**取回来的**都渲染完了，但服务端还有更旧的记录，
+        就再去取一页追加进来 —— 否则列表会永远停在最开始那 50 条，
+        更早的记录除了搜索没有任何办法翻到。
+        """
         if self._rendered >= len(self._entries):
+            if self._has_more and not self._loading_more:
+                self._load_more()
             return
         try:
             first, last = self.canvas.yview()
@@ -355,6 +600,36 @@ class MainPanel(object):
             return
         if last >= 0.88:
             self._render_batch()
+
+    def _load_more(self):
+        """按 offset 追加下一页（只用于浏览模式；搜索结果不分页）。"""
+        if self._loading_more or not self._has_more:
+            return
+        if self._current_query():
+            return
+        self._loading_more = True
+        try:
+            result = self.kernel.get_history(
+                limit=PAGE_SIZE, offset=len(self._entries),
+                content_type=self._type_filter,
+            )
+            if not result["ok"]:
+                self._has_more = False
+                return
+            fresh = result["data"]["items"]
+            # 按 id 去重：追加期间如果有新内容入库，offset 会错位，
+            # 不去重就会出现重复卡片。
+            known = {entry["id"] for entry in self._entries}
+            added = [entry for entry in fresh if entry["id"] not in known]
+            self._entries.extend(added)
+            # 取回来不足一页，或一条新的都没有，就到底了
+            self._has_more = len(fresh) >= PAGE_SIZE and bool(added)
+        finally:
+            self._loading_more = False
+        if self._rendered < len(self._entries):
+            self._render_batch()
+        else:
+            self._update_status()
 
     # ==================================================================
     # 检索
@@ -428,12 +703,17 @@ class MainPanel(object):
             )
             items = result["data"]["items"] if result["ok"] else []
             truncated = result["data"].get("truncated") if result["ok"] else False
+            # 搜索结果一次性取回（上限 SEARCH_RESULT_LIMIT），不做分页
+            self._has_more = False
         else:
             result = self.kernel.get_history(limit=PAGE_SIZE, content_type=self._type_filter)
             items = result["data"]["items"] if result["ok"] else []
             truncated = False
+            # 取满一页说明很可能还有更旧的记录；滚到底时再按 offset 取下一页
+            self._has_more = len(items) >= PAGE_SIZE
         self._entries = items
         self._truncated = truncated
+        self._loading_more = False
 
         counts = self.kernel.get_type_counts()
         self._counts = counts["data"]["counts"] if counts["ok"] else {}
@@ -454,6 +734,8 @@ class MainPanel(object):
                 child.destroy()
         self.empty_label.pack_forget()
         self._card_map = {}
+        self._thumb_refs = {}
+        self._icon_refs = {}
         self._rendered = 0
 
         if not self._entries:
@@ -491,6 +773,26 @@ class MainPanel(object):
         self.list_frame.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self._update_status()
+        # 如果一屏就把已取回的内容全显示完了，滚动事件永远不会到来，
+        # 分页就会卡死在第一页 —— 主动补一页。内容一旦超出可视区
+        # （yview 的 last < 1.0）就交回给滚动回调按需加载。
+        if self._has_more and not self._loading_more:
+            try:
+                self.window.after(30, self._maybe_auto_load)
+            except tk.TclError:
+                pass
+
+    def _maybe_auto_load(self):
+        """内容没占满一屏时主动取下一页（避免没有滚动条就永远不加载）。"""
+        if not self._has_more or self._loading_more:
+            return
+        try:
+            _first, last = self.canvas.yview()
+        except tk.TclError:
+            return
+        if last < 1.0:
+            return
+        self._load_more()
 
     def _gap(self):
         return theme_mod.DENSITY_METRICS.get(self._density, theme_mod.DENSITY_METRICS["normal"])["gap"]
@@ -544,15 +846,25 @@ class MainPanel(object):
             fg=tokens["text_faint"], font=(tokens["font_family"], 8),
         ).pack(side="right")
 
-        # ---- 第二行：预览（带命中高亮）
+        # ---- 第二行：缩略图 / 色块 / 文本预览（带命中高亮）
         preview = entry["preview"] or "（无预览）"
         if entry["contentType"] == TYPE_IMAGE:
             preview = preview or "[图片]"
-        self._build_preview(inner, card, preview, query, metrics)
+            # 缩略图取不到（附件被删、解码失败）就老实退回文本预览
+            if not self._build_thumbnail(inner, card, entry, metrics):
+                self._build_preview(inner, card, preview, query, metrics)
+        elif not self._build_color_swatch(inner, card, entry):
+            self._build_preview(inner, card, preview, query, metrics)
 
-        # ---- 第三行：来源 + 标签
+        # ---- 第三行：来源图标 + 名称 + 标签
         bottom = tk.Frame(inner, bg=card["bg"])
         bottom.pack(fill="x", pady=(2, 0))
+        icon = self._load_entry_icon(entry)
+        if icon is not None:
+            # 同缩略图：不留引用就会被 GC 掉，卡片上只剩空白
+            self._icon_refs[entry["id"]] = icon
+            tk.Label(bottom, image=icon, bg=card["bg"], bd=0).pack(
+                side="left", padx=(0, 4))
         tk.Label(
             bottom, text="来源：%s" % (entry["sourceApp"] or "未知"), bg=card["bg"],
             fg=tokens["text_muted"], font=(tokens["font_family"], 8),
@@ -563,8 +875,216 @@ class MainPanel(object):
                 fg=tokens["badge_url"], font=(tokens["font_family"], 8),
             ).pack(side="left", padx=(8, 0))
 
+        # ---- 第四行：逐条操作按钮（对应 TieZ 卡片的 item-actions）
+        self._build_actions(inner, card, entry)
+
         self._bind_card_events(card, entry)
         return card
+
+    def _build_thumbnail(self, parent, card, entry, metrics):
+        """图片卡片显示缩略图。取不到缩略图时返回 False，由调用方退回文本。"""
+        result = self.kernel.get_thumbnail(entry["id"])
+        if not result["ok"]:
+            return False
+        try:
+            photo = tk.PhotoImage(data=result["data"]["data"])
+        except tk.TclError:
+            return False
+        self._thumb_refs[entry["id"]] = photo
+
+        holder = tk.Frame(parent, bg=card["bg"])
+        holder.pack(fill="x", pady=(3, 0))
+        tk.Label(holder, image=photo, bg=card["bg"], bd=0).pack(side="left")
+        tk.Label(
+            holder, text=entry["preview"], bg=card["bg"],
+            fg=self._tokens["text_muted"], justify="left", anchor="nw",
+            font=(self._tokens["font_family"], 8),
+        ).pack(side="left", padx=(8, 0))
+        return True
+
+    def _load_entry_icon(self, entry):
+        """取卡片上的小图标：文件类用文件类型图标，其余用来源应用图标。
+
+        取不到就返回 None，卡片照常渲染（图标是装饰，不能挡住列表）。
+        """
+        entry_id = entry["id"]
+        try:
+            if entry["contentType"] in ("file", "video"):
+                result = self.kernel.get_file_type_icon(entry_id, size=16)
+                if not result["ok"]:
+                    result = self.kernel.get_source_app_icon(entry_id, size=16)
+            else:
+                result = self.kernel.get_source_app_icon(entry_id, size=16)
+        except Exception:  # noqa: BLE001
+            return None
+        if not result["ok"]:
+            return None
+        try:
+            return tk.PhotoImage(data=result["data"]["data"])
+        except tk.TclError:
+            return None
+
+    def _build_color_swatch(self, parent, card, entry):
+        """内容就是颜色值时，直接画一个色块（TieZ 同款细节）。
+
+        返回 True 表示已经渲染过，调用方不要再画文本预览。
+        """
+        if entry["contentType"] not in (TYPE_TEXT, TYPE_CODE):
+            return False
+        raw = (entry.get("content") or "").strip()
+        if len(raw) > 32 or not _COLOR_RE.match(raw):
+            return False
+        hex_color = _normalize_color(raw)
+        if not hex_color:
+            return False
+        try:
+            row = tk.Frame(parent, bg=card["bg"])
+            row.pack(fill="x", pady=(3, 0))
+            # 色块本身用归一后的 #rrggbb，右边显示用户原本复制到的写法
+            tk.Label(row, text="   ", bg=hex_color, bd=1, relief="solid",
+                     font=(self._tokens["font_family"], 6)).pack(side="left")
+            tk.Label(row, text=raw, bg=card["bg"], fg=self._tokens["text"],
+                     font=(self._tokens["font_family"], 9)).pack(side="left", padx=(8, 0))
+        except tk.TclError:
+            return False
+        return True
+
+    def _build_actions(self, parent, card, entry):
+        """卡片右下角的逐条操作按钮。"""
+        tokens = self._tokens
+        entry_id = entry["id"]
+        row = tk.Frame(parent, bg=card["bg"])
+        row.pack(fill="x", pady=(3, 0))
+        # 从右往左排，所以列表本身是反的；「打开」放最后 → 显示在最左边
+        actions = [
+            ("删除", self._card_delete),
+            ("标签", self._card_tag),
+            ("取消置顶" if entry["isPinned"] else "置顶", self._card_toggle_pin),
+            ("复制", self._card_copy),
+            ("粘贴", self._card_paste),
+            ("打开", self._card_open),
+        ]
+        for text, handler in actions:
+            tk.Button(
+                row, text=text, command=lambda h=handler, i=entry_id: h(i),
+                bd=0, relief="flat", cursor="hand2", padx=6, pady=0,
+                bg=tokens["surface_alt"], fg=tokens["text_muted"],
+                activebackground=tokens["accent"], activeforeground="#FFFFFF",
+                font=(tokens["font_family"], 8),
+            ).pack(side="right", padx=(4, 0))
+
+    # ---- 逐条操作：先选中再复用已有的动作实现，避免逻辑分叉
+    def _card_paste(self, entry_id):
+        self._select(entry_id)
+        self.paste_selected()
+
+    def _card_copy(self, entry_id):
+        self._select(entry_id)
+        self.copy_selected()
+
+    def _card_toggle_pin(self, entry_id):
+        self._select(entry_id)
+        self._toggle_pin_selected()
+
+    def _card_tag(self, entry_id):
+        self._select(entry_id)
+        self._tag_selected()
+
+    def _card_delete(self, entry_id):
+        self._select(entry_id)
+        self._delete_selected()
+
+    def _card_open(self, entry_id):
+        self._select(entry_id)
+        self.open_selected()
+
+    def _ignore_source_app(self):
+        """把选中记录的来源应用一键加进"忽略采集"规则。
+
+        比让用户去设置里手打 exe 名靠谱得多：应用名与进程路径直接从记录里取。
+        """
+        if self._selected_id is None:
+            self.toast.show("请先选中一条记录", TOAST_INFO)
+            return
+        entry = next((e for e in self._entries if e["id"] == self._selected_id), None)
+        if entry is None:
+            return
+        source = entry.get("sourceApp") or ""
+        if not source or source == "未知":
+            self.toast.show("这条记录没有来源应用信息", TOAST_INFO)
+            return
+        if not messagebox.askyesno(
+                "忽略来源应用",
+                "以后不再采集来自「%s」的复制内容？\n\n"
+                "可以在设置 → 应用规则里修改或删除这条规则。" % source,
+                parent=self.window):
+            return
+        result = self.kernel.add_app_rule_for_entry(self._selected_id, "ignore")
+        if result["ok"]:
+            self.toast.show("已忽略「%s」，共 %d 条规则"
+                            % (source, result["data"]["count"]), TOAST_SUCCESS, 2400)
+        else:
+            self.toast.show(result["error"]["message"], TOAST_ERROR)
+
+    def _queue_selected(self):
+        """把选中记录加入顺序粘贴队列。"""
+        if self._selected_id is None:
+            self.toast.show("请先选中一条记录", TOAST_INFO)
+            return
+        result = self.kernel.add_to_paste_queue(self._selected_id)
+        if result["ok"]:
+            self.toast.show("已加入顺序粘贴队列（共 %d 条）"
+                            % result["data"]["size"], TOAST_SUCCESS, 1600)
+            self._update_status()
+        else:
+            self.toast.show(result["error"]["message"], TOAST_ERROR)
+
+    def add_manual(self):
+        """手动新增一条记录（对应命令 add_manual_item）。"""
+        EditorDialog(
+            self.window, self._tokens, "",
+            on_save=self._apply_manual_add,
+            title="手动新增记录",
+            hint="直接写一条进历史，不走剪贴板。类型由内容自动判定"
+                 "（网址判成网址、代码判成代码）。",
+        )
+
+    def _apply_manual_add(self, content):
+        if not (content or "").strip():
+            self.toast.show("内容不能为空", TOAST_WARNING)
+            return
+        result = self.kernel.add_manual_item(content)
+        if result["ok"]:
+            self.toast.show("已新增一条记录", TOAST_SUCCESS)
+            self.refresh(keep_selection=False)
+        else:
+            self.toast.show(result["error"]["message"], TOAST_ERROR)
+
+    def move_pinned_selected(self, delta):
+        """把选中的置顶记录在置顶区里上移 / 下移（对应命令 update_pinned_order）。"""
+        if self._selected_id is None:
+            self.toast.show("请先选中一条记录", TOAST_INFO)
+            return
+        result = self.kernel.move_pinned(self._selected_id, delta)
+        if not result["ok"]:
+            self.toast.show(result["error"]["message"], TOAST_ERROR)
+            return
+        if not result["data"]["moved"]:
+            self.toast.show("已经在置顶区的边缘了", TOAST_INFO, 1200)
+            return
+        # 置顶区按 pinned_order 排，改完必须整表刷新才能看到新顺序
+        self.refresh(keep_selection=True)
+
+    def open_selected(self):
+        """用系统默认程序打开选中记录（UC-09 备选流 A5）。"""
+        if self._selected_id is None:
+            self.toast.show("请先选中一条记录", TOAST_INFO)
+            return
+        result = self.kernel.open_content(self._selected_id)
+        if not result["ok"]:
+            self.toast.show(result["error"]["message"], TOAST_ERROR)
+        else:
+            self.toast.show("已用默认程序打开", TOAST_SUCCESS, 1600)
 
     def _build_preview(self, parent, card, preview, query, metrics):
         """预览文本；检索时把命中片段高亮出来（F5-4 命中高亮）。"""
@@ -613,6 +1133,7 @@ class MainPanel(object):
             "url": tokens["badge_url"],
             "image": tokens["badge_image"],
             "file": tokens["badge_file"],
+            "video": tokens["badge_file"],
         }.get(content_type, tokens["badge_text"])
 
     # ==================================================================
@@ -629,6 +1150,9 @@ class MainPanel(object):
             self.paste_selected()
 
         for widget in _walk(card):
+            # 按钮自己处理点击，不要再叠选中/双击粘贴，否则双击按钮会误触粘贴
+            if isinstance(widget, tk.Button):
+                continue
             widget.bind("<Enter>", lambda e, c=card, i=entry_id: self._on_card_enter(c, i))
             widget.bind("<Leave>", lambda e, c=card, i=entry_id: self._on_card_leave(c, i))
             widget.bind("<Button-1>", select)
@@ -645,6 +1169,7 @@ class MainPanel(object):
                             child.configure(bg=self._tokens["surface_hover"])
                     except tk.TclError:
                         pass
+        self._preview().schedule(entry_id)
 
     def _on_card_leave(self, card, entry_id):
         if entry_id != self._selected_id:
@@ -655,6 +1180,25 @@ class MainPanel(object):
                         child.configure(bg=self._tokens["surface"])
                 except tk.TclError:
                     pass
+        self._preview().cancel()
+
+    # ==================================================================
+    # 紧凑预览浮窗
+    # ==================================================================
+    def _preview(self):
+        """懒加载预览浮窗（只建一次，反复建窗口在 Windows 上会闪）。"""
+        popup = getattr(self, "_preview_popup", None)
+        if popup is None:
+            from app.ui.preview_window import PreviewPopup  # noqa: PLC0415
+
+            popup = PreviewPopup(self)
+            self._preview_popup = popup
+        return popup
+
+    def hide_preview(self):
+        """隐藏预览浮窗（滚动、按键、粘贴、收起面板时都要调）。"""
+        if getattr(self, "_preview_popup", None) is not None:
+            self._preview_popup.cancel()
 
     def _select(self, entry_id):
         previous = self._selected_id
@@ -756,6 +1300,14 @@ class MainPanel(object):
         if result["ok"]:
             self.toast.show("已复制到剪贴板", TOAST_SUCCESS)
         else:
+            self.toast.show(result["error"]["message"], TOAST_ERROR)
+
+    def _open_selected_location(self):
+        """打开选中记录对应文件所在目录并选中它。"""
+        if self._selected_id is None:
+            return
+        result = self.kernel.open_entry_location(self._selected_id)
+        if not result["ok"]:
             self.toast.show(result["error"]["message"], TOAST_ERROR)
 
     def _copy_as_file_selected(self):
@@ -868,7 +1420,58 @@ class MainPanel(object):
         self.kernel.set_listening(paused)
 
     def open_settings(self):
+        # 必须延迟导入：app/ui/__init__.py 先导入 panel 再导入 settings_window，
+        # 在模块顶层直接 import 会形成导入环。放在函数内既避开环，也保证
+        # SettingsWindow 这个名字一定存在于本函数的全局命名空间里
+        # ——之前这里漏了导入，三个入口（右键菜单、Ctrl+,、托盘）全部
+        # 抛 NameError，设置窗口完全打不开。
+        from app.ui.settings_window import SettingsWindow  # noqa: PLC0415
+
+        # 设置窗口是单例：已经开着就抬到前面，不要再叠一个。
+        # （原来每次点击都新建，点三下就是三个窗口，关起来还得关三次。）
+        for child in self.window.winfo_children():
+            if isinstance(child, SettingsWindow):
+                try:
+                    if child.winfo_exists():
+                        child.deiconify()
+                        child.lift()
+                        child.focus_force()
+                        return
+                except tk.TclError:
+                    pass
         SettingsWindow(self)
+
+    def open_tag_manager(self):
+        """打开标签管理器（单例，同设置窗口的处理）。"""
+        from app.ui.tag_manager import TagManager  # noqa: PLC0415
+
+        for child in self.window.winfo_children():
+            if isinstance(child, TagManager):
+                try:
+                    if child.winfo_exists():
+                        child.deiconify()
+                        child.lift()
+                        child.focus_force()
+                        return
+                except tk.TclError:
+                    pass
+        TagManager(self)
+
+    def open_emoji_panel(self):
+        """打开表情面板（单例）。"""
+        from app.ui.emoji_panel import EmojiPanel  # noqa: PLC0415
+
+        for child in self.window.winfo_children():
+            if isinstance(child, EmojiPanel):
+                try:
+                    if child.winfo_exists():
+                        child.deiconify()
+                        child.lift()
+                        child.focus_force()
+                        return
+                except tk.TclError:
+                    pass
+        EmojiPanel(self)
 
     # ==================================================================
     # 右键菜单
@@ -891,6 +1494,10 @@ class MainPanel(object):
                        bd=0)
         menu.add_command(label="粘贴（回车）", command=self.paste_selected)
         menu.add_command(label="仅复制到剪贴板", command=self.copy_selected)
+        menu.add_command(label="打开（用默认程序）", command=self.open_selected)
+        if entry["contentType"] in ("file", "video"):
+            menu.add_command(label="打开文件所在位置",
+                             command=self._open_selected_location)
         if entry["contentType"] == "image":
             # 图片默认走 CF_DIB（位图），粘到文件夹里不会有任何反应；
             # 这一项改成把附件文件路径放上剪贴板，资源管理器才认得。
@@ -901,13 +1508,26 @@ class MainPanel(object):
             label="取消置顶" if entry["isPinned"] else "置顶",
             command=self._toggle_pin_selected,
         )
+        if entry["isPinned"]:
+            # 只有置顶项才有"置顶区顺序"这回事
+            menu.add_command(label="在置顶区上移（Ctrl+↑）",
+                             command=lambda: self.move_pinned_selected(-1))
+            menu.add_command(label="在置顶区下移（Ctrl+↓）",
+                             command=lambda: self.move_pinned_selected(1))
         menu.add_command(label="添加标签…", command=self._tag_selected)
+        menu.add_command(label="管理标签…", command=self.open_tag_manager)
+        menu.add_command(label="表情…", command=self.open_emoji_panel)
+        menu.add_separator()
+        menu.add_command(label="忽略此来源应用", command=self._ignore_source_app)
         menu.add_command(
             label="编辑内容…" if is_text_type(entry["contentType"]) else "编辑内容（仅文本类）",
             command=self._edit_selected,
         )
         menu.add_separator()
         menu.add_command(label="删除（Delete）", command=self._delete_selected)
+        menu.add_separator()
+        menu.add_command(label="加入顺序粘贴队列", command=self._queue_selected)
+        menu.add_command(label="手动新增一条…", command=self.add_manual)
         menu.add_separator()
         menu.add_command(label="清空历史…", command=self.clear_history)
         menu.add_command(label="设置…", command=self.open_settings)
@@ -942,13 +1562,16 @@ class MainPanel(object):
             self.window.geometry("+%d+%d" % self._default_pos)
 
         self._capture_paste_target()
+        # 先修位置再显示：上一次可能是在已拔掉的外接屏上退出的，
+        # 不修的话用户按了快捷键什么都没发生（窗口在屏幕外）
+        self._repair_position()
         try:
             self.window.deiconify()
             if self.window.state() == "iconic":
                 self.window.state("normal")
         except tk.TclError:
             pass
-        self.window.attributes("-topmost", bool(self.kernel.settings.get(K_ALWAYS_ON_TOP)))
+        self._apply_topmost()
         self.window.lift()
         self.window.focus_force()
         self._visible = True
@@ -956,6 +1579,18 @@ class MainPanel(object):
         if focus_search:
             self._focus_search()
         self._start_polling()
+
+    def _bind_preview_dismiss(self, widget):
+        """滚轮 / 按键 / 点击时收起预览浮窗。
+
+        浮窗是"看"的东西，一旦用户开始操作就该让路——
+        挡在那儿只会碍事。
+        """
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Key>"):
+            try:
+                widget.bind(sequence, lambda e: self.hide_preview(), add="+")
+            except tk.TclError:
+                pass
 
     def _capture_paste_target(self):
         """登记"粘贴时要回到哪个窗口"。"""
@@ -991,6 +1626,7 @@ class MainPanel(object):
         # 否则用户刚按 Esc 收起面板，120ms 轮询就把上一轮积压的
         # 唤出事件应用上去，面板又弹回来了
         self._hidden_at = time.time()
+        self.hide_preview()
         try:
             self.window.withdraw()
         except tk.TclError:
@@ -1035,6 +1671,45 @@ class MainPanel(object):
             self.hide()
         else:
             self.show()
+
+    # ==================================================================
+    # 焦点控制（对应 TieZ 的 activate_window_focus / restore_last_focus）
+    # ==================================================================
+    def activate_window_focus(self):
+        """显式把焦点抢到面板上（输入框聚焦时用）。
+
+        ``focus_force`` 是必需的：面板是 ``-topmost`` 的悬浮窗，
+        普通 ``focus_set`` 在别的程序正前台时不一定抢得到焦点。
+        """
+        try:
+            if self.window.state() == "iconic":
+                self.window.state("normal")
+            self.window.deiconify()
+            self.window.lift()
+            self.window.focus_force()
+        except tk.TclError:
+            return False
+        self._focus_search()
+        return True
+
+    def restore_last_focus(self):
+        """把焦点还给"唤出面板之前"那个窗口（对应命令 restore_last_focus）。
+
+        隐藏面板时也要做这件事，否则焦点会留在已经隐藏的窗口上，
+        用户敲键盘没有任何反应——看起来像"整个程序卡死了"。
+        """
+        from app.infrastructure.clipboard import paste as paste_mod
+
+        target = self.kernel.paste_target()
+        if not target:
+            return False
+        try:
+            own = int(self.window.winfo_id())
+        except tk.TclError:
+            return False
+        if int(target) == own:
+            return False
+        return bool(paste_mod.focus_window(target))
 
     def is_visible(self):
         return self._visible
@@ -1113,6 +1788,14 @@ class MainPanel(object):
                     return
                 self.show(focus_search=False)
                 self.open_settings()
+            elif action == "hide_panel":
+                self.hide()
+            elif action == "activate_focus":
+                self.activate_window_focus()
+            elif action == "restore_last_focus":
+                self.restore_last_focus()
+            elif action == "toggle_pinned":
+                self.toggle_pinned()
             elif action == "exit":
                 self.root.event_generate("<<ClipboardProExit>>")
             elif message and message not in ("show", "hotkey"):
@@ -1185,6 +1868,12 @@ class MainPanel(object):
             state, current_filter, shown, len(self._entries), hotkey)
         if getattr(self, "_truncated", False):
             text += " · 结果过多，请补充关键字"
+        if getattr(self, "_has_more", False):
+            text += " · 滚到底自动加载更早的记录"
+        # 顺序模式下把队列进度显示出来：不然用户不知道还剩几条没粘
+        queue_state = self.kernel.get_paste_queue()
+        if queue_state["ok"] and queue_state["data"]["sequentialMode"]:
+            text += " · 顺序粘贴 %d 条待粘" % queue_state["data"]["size"]
         try:
             self.status_label.configure(text=text,
                                         fg=self._tokens["pin"] if paused
@@ -1210,15 +1899,17 @@ class EditorDialog(tk.Toplevel):
     Destroy 事件）。回调式还顺带避免了"对话框没关就点别的"这类焦点问题。
     """
 
-    def __init__(self, parent, tokens, content, on_save=None):
+    def __init__(self, parent, tokens, content, on_save=None,
+                 title="编辑记录内容",
+                 hint="内容（保存后会重新计算指纹，重复判定按新内容生效）"):
         super().__init__(parent)
         self.on_save = on_save
-        self.title("编辑记录内容")
+        self.title(title)
         self.configure(bg=tokens["bg"])
         self.transient(parent)
         self.resizable(True, True)
 
-        tk.Label(self, text="内容（保存后会重新计算指纹，重复判定按新内容生效）",
+        tk.Label(self, text=hint,
                  bg=tokens["bg"], fg=tokens["text_muted"],
                  font=(tokens["font_family"], 9)).pack(anchor="w", padx=12, pady=(10, 4))
         self.text = tk.Text(
@@ -1275,6 +1966,60 @@ def _walk(widget):
         current = stack.pop()
         yield current
         stack.extend(current.winfo_children())
+
+
+def _normalize_color(value):
+    """把颜色字面量归一成 tkinter 认得的 ``#rrggbb``；认不出返回 None。
+
+    tk 只认颜色名和 ``#rrggbb``，而用户复制到的往往是 ``#rrggbbaa``、
+    ``rgb()``、``rgba()``、``hsl()`` —— 直接拿去当背景色会抛 TclError。
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    try:
+        if lowered.startswith("#"):
+            digits = lowered[1:]
+            # 必须全是十六进制字符：否则 "#这是一段中文" 这种会被当成颜色
+            if any(ch not in "0123456789abcdef" for ch in digits):
+                return None
+            if len(digits) == 3:
+                return "#" + "".join(ch * 2 for ch in digits)
+            if len(digits) in (6, 8):
+                return "#" + digits[:6]          # tk 不认 8 位，丢掉 alpha
+            return None
+
+        if lowered.startswith(("rgb(", "rgba(")):
+            inner = text[text.index("(") + 1:text.rindex(")")]
+            parts = [p.strip() for p in inner.split(",")]
+            if len(parts) < 3:
+                return None
+            channels = []
+            for part in parts[:3]:
+                if part.endswith("%"):
+                    channels.append(int(round(float(part[:-1]) * 255 / 100.0)))
+                else:
+                    channels.append(int(round(float(part))))
+            if any(c < 0 or c > 255 for c in channels):
+                return None
+            return "#%02x%02x%02x" % tuple(channels)
+
+        if lowered.startswith(("hsl(", "hsla(")):
+            inner = text[text.index("(") + 1:text.rindex(")")]
+            parts = [p.strip() for p in inner.split(",")]
+            if len(parts) < 3:
+                return None
+            hue = (float(parts[0].rstrip("deg")) % 360) / 360.0
+            sat = float(parts[1].rstrip("%")) / 100.0
+            light = float(parts[2].rstrip("%")) / 100.0
+            red, green, blue = colorsys.hls_to_rgb(hue, light, sat)
+            return "#%02x%02x%02x" % (int(round(red * 255)),
+                                      int(round(green * 255)),
+                                      int(round(blue * 255)))
+    except (ValueError, IndexError):
+        return None
+    return None
 
 
 def _split_by_query(text, query):

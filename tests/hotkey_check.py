@@ -33,7 +33,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.constants import K_MAIN_HOTKEY, K_SEARCH_HOTKEY  # noqa: E402
+from app.constants import (  # noqa: E402
+    K_MAIN_HOTKEY,
+    K_RICH_PASTE_HOTKEY,
+    K_SEARCH_HOTKEY,
+)
 from app.infrastructure.clipboard import listener as listener_mod  # noqa: E402
 from app.infrastructure.clipboard import win32 as w32  # noqa: E402
 from app.main import Application  # noqa: E402
@@ -108,6 +112,9 @@ def test_hotkeys_registered(app):
           "「唤起主面板」拿到了可用快捷键：%s" % registered.get(listener_mod.ACTION_MAIN_PANEL))
     check(listener_mod.ACTION_SEARCH in registered,
           "「唤起搜索」拿到了可用快捷键：%s" % registered.get(listener_mod.ACTION_SEARCH))
+    check(listener_mod.ACTION_RICH_PASTE in registered,
+          "**「带格式粘贴」一直注册着**（它是「不开面板直接粘」的常用路径）：%s"
+          % registered.get(listener_mod.ACTION_RICH_PASTE))
 
     report = app.kernel.listener.registration_report()
     if report["substituted"]:
@@ -295,6 +302,99 @@ def test_real_keypress(app):
 
 
 # ---------------------------------------------------------------------------
+def test_rich_paste_hotkey(app):
+    """批次 15：带格式粘贴快捷键。
+
+    它是"不开面板，直接把最新一条带格式粘到当前窗口"的快捷方式。
+    历史里没有富文本时要**退回最新一条**——不然用户按了毫无反应，
+    只会认为快捷键坏了。
+    """
+    print("\n=== 3) 带格式粘贴快捷键 ===")
+    diag = app.kernel.listener.diagnostics()
+    registered = diag["registeredHotkeys"]
+    hotkey = registered.get(listener_mod.ACTION_RICH_PASTE)
+    check(bool(hotkey), "带格式粘贴拿到了快捷键：%s" % hotkey)
+    check(app.kernel.settings.get(K_RICH_PASTE_HOTKEY) == hotkey,
+          "配置里的值与实际生效的一致（没有出现「显示的和按的对不上」）")
+
+    # 改成另一个组合
+    changed = app.kernel.set_hotkey(listener_mod.ACTION_RICH_PASTE, "Ctrl+Alt+Z")
+    check(changed["ok"] and changed["data"]["accelerator"] == "Ctrl+Alt+Z",
+          "能改成别的组合：%s"
+          % (changed["data"]["accelerator"] if changed["ok"] else changed["error"]))
+    pump(app, 0.5)
+    check(app.kernel.listener.diagnostics()["registeredHotkeys"].get(
+        listener_mod.ACTION_RICH_PASTE) == "Ctrl+Alt+Z", "重新注册后生效")
+    bad = app.kernel.set_hotkey(listener_mod.ACTION_RICH_PASTE, "不是快捷键")
+    check(not bad["ok"], "非法格式被拒绝（%s）" % bad["error"]["code"])
+
+    # 动作本身：没有富文本时退回最新一条
+    app.kernel.simulate_capture("带格式粘贴测试用的普通文本")
+    result = app.kernel.paste_latest_rich(simulate=False)
+    check(result["ok"], "没有富文本时退回最新一条，而不是报错")
+    check(result["data"]["id"] > 0, "确实粘了一条记录（id=%s）" % result["data"]["id"])
+
+    # 快捷键入口：任何情况下都不许抛
+    app.kernel._paste_latest_rich_safe()
+    check(True, "快捷键入口在正常路径下不抛异常")
+
+    # **把状态还回去**：粘贴流程会顺手收起面板，不恢复的话后面
+    # 依赖"面板当前是显示的"的用例（托盘、暂停监听）会莫名其妙地失败。
+    app.panel.show(focus_search=False)
+    pump(app, 0.5)
+    check(app.panel._visible is True, "测试结束后把面板恢复成显示状态")
+
+
+def test_rich_paste_empty_history():
+    """空历史时按快捷键不能炸。"""
+    print("\n=== 4) 空历史时按带格式粘贴 ===")
+    from app.app.kernel import Kernel
+    import tempfile
+    empty = Kernel(data_dir=tempfile.mkdtemp(prefix="clipboardpro_hotkey_"))
+    empty.start(enable_listener=False)
+    try:
+        result = empty.paste_latest_rich(simulate=False)
+        check(not result["ok"], "空历史返回失败而不是抛异常")
+        check("还没有任何记录" in result["error"]["message"],
+              "给出可读的提示：%s" % result["error"]["message"])
+        empty._paste_latest_rich_safe()
+        check(True, "**快捷键入口在空历史下也不抛**（抛了用户只会觉得程序坏了）")
+    finally:
+        empty.shutdown()
+
+
+def test_recording_mode(app):
+    """录制快捷键期间必须把全局快捷键让出去（对应 set_recording_mode）。
+
+    不这么做的话，用户想录的组合一旦是**当前已注册的**（比如想改
+    Ctrl+Shift+V 本身），Windows 会先把它截走，录制窗口根本收不到
+    那个按键——用户只会觉得录制功能坏了。
+    """
+    print("\n=== 5) 录制模式：临时让出全局快捷键 ===")
+    before = dict(app.kernel.listener.diagnostics()["registeredHotkeys"])
+    check(bool(before), "录制前有注册着的快捷键：%s" % sorted(before))
+
+    app.kernel.set_recording_mode(True)
+    pump(app, 0.6)
+    during = dict(app.kernel.listener.diagnostics()["registeredHotkeys"])
+    check(during == {}, "**录制期间全部注销**（实际 %s）" % sorted(during))
+
+    app.kernel.set_recording_mode(False)
+    pump(app, 0.8)
+    after = dict(app.kernel.listener.diagnostics()["registeredHotkeys"])
+    check(set(after) == set(before),
+          "**录完恢复原样**：%s" % sorted(after))
+
+    # 反复开关不能把快捷键弄丢
+    for _ in range(3):
+        app.kernel.set_recording_mode(True)
+        pump(app, 0.3)
+        app.kernel.set_recording_mode(False)
+        pump(app, 0.35)
+    final = dict(app.kernel.listener.diagnostics()["registeredHotkeys"])
+    check(set(final) == set(before), "**三次开关后仍然都注册着**：%s" % sorted(final))
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="clipboardpro_hotkey_")
     print("数据目录：%s" % tmp)
@@ -311,6 +411,8 @@ def main():
         test_show_from_hidden(app)
         test_repeated_toggle(app)
         test_search_hotkey(app)
+        test_rich_paste_hotkey(app)
+        test_recording_mode(app)
         test_tray(app)
         test_toggle_listen(app)
         test_real_keypress(app)
@@ -327,6 +429,8 @@ def main():
             app.root.destroy()
         except Exception:  # noqa: BLE001
             pass
+
+    test_rich_paste_empty_history()
 
     print("\n" + "=" * 72)
     print("通过 %d 项，失败 %d 项" % (len(PASSED), len(FAILED)))

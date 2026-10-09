@@ -20,6 +20,7 @@
 from app.constants import (
     ERR_INTERNAL,
     K_CAPTURE_RICH_TEXT,
+    K_CLEANUP_RULES,
     K_DEDUPLICATE,
     K_PERSISTENT,
     MAX_CONTENT_LEN,
@@ -29,6 +30,7 @@ from app.constants import (
 )
 from app.domain.models import ClipboardEntry, make_preview
 from app.errors import AppError, now_ms
+from app.services import app_rules as app_rules_mod
 from app.services import content_utils
 
 
@@ -116,13 +118,33 @@ class DiscoveryStage(PipelineStage):
 class TransformationStage(PipelineStage):
     name = "transformation"
 
-    def __init__(self, settings=None, privacy=None, attachment_dir=None, logger=None):
+    def __init__(self, settings=None, privacy=None, attachment_dir=None,
+                 thumb_dir=None, logger=None, app_rules=None):
         self.settings = settings
         self.privacy = privacy
         self.attachment_dir = attachment_dir
+        #: 缩略图缓存目录（图片入库时顺手生成一张，列表就不用每次解码原图）
+        self.thumb_dir = thumb_dir
+        #: 应用级规则引擎（按来源应用忽略采集 / 自动清洗）
+        self.app_rules = app_rules
         self.logger = logger
 
     def process(self, ctx):
+        # 应用级规则**先裁决**：忽略采集要在做任何处理之前生效，
+        # 否则白白解码图片、算指纹，最后才把结果丢掉。
+        if self.app_rules is not None:
+            action, text, policy = self.app_rules.evaluate(
+                ctx.source_app, ctx.source_app_path, ctx.content_type, ctx.content)
+            if action == app_rules_mod.ACTION_IGNORE:
+                if self.logger:
+                    self.logger.info("按应用规则忽略采集：%s（策略 %s）",
+                                     ctx.source_app, policy.get("id") or "-")
+                ctx.stop("ignored")
+                return
+            if action == app_rules_mod.ACTION_CLEAN \
+                    and ctx.content_type in app_rules_mod.TEXT_CONTENT_TYPES:
+                ctx.content = text
+
         if ctx.content_type == TYPE_IMAGE:
             self._process_image(ctx)
         else:
@@ -168,6 +190,7 @@ class TransformationStage(PipelineStage):
         """图片处理：解码 → 计算像素指纹 → 外置为附件 → content 存路径（F2-3）。"""
         from io import BytesIO
         from PIL import Image
+        from app.infrastructure import thumbnails
         from app.infrastructure.clipboard import image_utils
         from app.infrastructure.repository import attachments
 
@@ -190,32 +213,25 @@ class TransformationStage(PipelineStage):
             )
             ctx.attachment_path = path
             ctx.content = path
+            # 顺手把缩略图也生成好。放在这里而不是列表渲染时做，
+            # 是因为采集只有一次，而列表每次刷新都会重画。
+            thumbnails.ensure_thumbnail(
+                self.thumb_dir, path, logger=self.logger)
         else:
             ctx.content = ""
         ctx.preview = "[图片] %d × %d" % image.size
 
     def _apply_cleanup_rules(self, text):
-        """入库前的文本清理规则（配置项 app.cleanup_rules）。
+        """入库前的**全局**文本清理规则（配置项 app.cleanup_rules）。
 
-        格式为多条 "正则=>替换" 规则，用换行或 || 分隔，默认配置为空。
-        规则写错时忽略该条并记日志，绝不让一次错误配置挡住所有复制。
+        解析交给 ``app_rules.parse_cleanup_rules``：应用级规则与全局规则
+        用同一套格式与同一份实现，不会出现"两处行为不一致"。
         """
-        raw = (self.settings.get("app.cleanup_rules") or "").strip() if self.settings else ""
+        raw = (self.settings.get(K_CLEANUP_RULES) or "") if self.settings else ""
         if not raw:
             return text
-        import re
-        result = text
-        for line in re.split(r"[\n|]{2,}|\n", raw):
-            line = line.strip()
-            if not line or "=>" not in line:
-                continue
-            pattern, _, replacement = line.partition("=>")
-            try:
-                result = re.sub(pattern.strip(), replacement.strip(), result)
-            except re.error as exc:
-                if self.logger:
-                    self.logger.warning("清理规则 %r 无效，已忽略：%s", line, exc)
-        return result
+        rules = app_rules_mod.parse_cleanup_rules(raw, self.logger)
+        return app_rules_mod.apply_cleanup_rules(text, rules)
 
 
 # ---------------------------------------------------------------------------
@@ -345,10 +361,12 @@ class PersistenceStage(PipelineStage):
 class DistributionStage(PipelineStage):
     name = "distribution"
 
-    def __init__(self, capacity=None, emit=None, logger=None):
+    def __init__(self, capacity=None, emit=None, logger=None, on_captured=None):
         self.capacity = capacity
         self.emit = emit
         self.logger = logger
+        #: 每成功入库一条就回调一次（顺序粘贴队列用它自动收集）
+        self.on_captured = on_captured
 
     def process(self, ctx):
         session_only = ctx.session_only
@@ -364,6 +382,15 @@ class DistributionStage(PipelineStage):
                 "merged": ctx.merged,
                 "sessionOnly": session_only,
             })
+        # 顺序粘贴：每采集到**新**记录就进队。合并（重复内容）不进队，
+        # 否则连按两次同样的复制会在队列里塞两条一样的。
+        if self.on_captured is not None and ctx.entry is not None \
+                and ctx.outcome == "inserted":
+            try:
+                self.on_captured(ctx.entry)
+            except Exception as exc:  # noqa: BLE001 - 入队失败不影响入库
+                if self.logger:
+                    self.logger.warning("顺序粘贴入队失败：%s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +491,13 @@ class SessionStore(object):
     def find_duplicate(self, content_type, content_hash):
         for entry in self._items:
             if entry.content_type == content_type and entry.content_hash == content_hash:
+                return entry
+        return None
+
+    def find_by_id(self, entry_id):
+        """按 id 找会话记录（顺序粘贴队列会用到负数 id）。"""
+        for entry in self._items:
+            if entry.id == entry_id:
                 return entry
         return None
 

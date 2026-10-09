@@ -104,25 +104,36 @@ def main():
         print("=== 1) 启动系统记事本 ===")
         # Win11 的记事本是多进程的 UWP 打包应用，Popen 拿到的 pid 不一定是
         # 真正持有窗口的那个进程，因此用"启动前后窗口集合的差集"来找它。
+        #
+        # 两个坑（本测试一开始就是在这两处翻车的）：
+        #   1. 启动瞬间会先冒出一个宿主/加载窗口，它**不是**真正的记事本；
+        #      抓到它再去找编辑区必然找不到。所以优先挑类名里带 Notepad 的。
+        #   2. XAML 界面是异步加载的，窗口出现 ≠ 编辑区就绪。
+        #      必须**轮询等待**编辑区，而不是抓到窗口就立刻去找。
         before_windows = _list_top_windows()
         notepad = subprocess.Popen(["notepad.exe"])
         notepad_hwnd = 0
-        for _ in range(60):
+        deadline = time.time() + 20
+        while time.time() < deadline and not notepad_hwnd:
             time.sleep(0.2)
-            new_windows = _list_top_windows() - before_windows
-            candidates = [h for h in new_windows if _window_title(h)]
-            if candidates:
-                notepad_hwnd = candidates[0]
-                break
+            new_windows = [h for h in (_list_top_windows() - before_windows)
+                           if _window_title(h)]
+            if not new_windows:
+                continue
+            # 优先类名像记事本的
+            preferred = [h for h in new_windows
+                         if "notepad" in _class_name(h).lower()]
+            candidate = (preferred or new_windows)[0]
+            # 光有窗口还不够，得有编辑区才算真的就绪
+            if _find_edit_area(candidate):
+                notepad_hwnd = candidate
         check(notepad_hwnd != 0,
               "找到新出现的记事本窗口（hwnd=%s，标题=%r）"
               % (notepad_hwnd, _window_title(notepad_hwnd)))
         if not notepad_hwnd:
             raise SystemExit(1)
 
-        edit_hwnd = find_child_window(notepad_hwnd, "Edit") or \
-            find_child_window(notepad_hwnd, "RichEditD2DPT") or \
-            find_child_window(notepad_hwnd, "Windows.UI.Core.CoreWindow")
+        edit_hwnd = _find_edit_area(notepad_hwnd)
         check(edit_hwnd != 0, "找到记事本编辑区（hwnd=%s，类名=%s）"
               % (edit_hwnd, _class_name(edit_hwnd)))
 
@@ -209,6 +220,37 @@ def main():
         for item in FAILED:
             print("  - %s" % item)
         return 1
+    return 0
+
+
+def _find_edit_area(parent_hwnd):
+    """在记事本窗口里找编辑区；找不到返回 0。
+
+    新版记事本（Win11 的 UWP/XAML 版本）编辑区不是经典的 Win32 子窗口，
+    所以这里把几种可能的类名都试一遍，并且**递归**找一层——
+    有些版本中间还夹着一层容器窗口。
+    """
+    for class_name in ("Edit", "RichEditD2DPT", "Windows.UI.Core.CoreWindow",
+                       "NotepadTextBox", "TextBox"):
+        found = find_child_window(parent_hwnd, class_name)
+        if found:
+            return found
+    # 递归一层：编辑区可能在中间容器里
+    containers = []
+
+    @w32.WNDENUMPROC
+    def collect(hwnd, _lparam):
+        containers.append(int(hwnd))
+        return len(containers) < 64
+
+    w32.user32.EnumChildWindows(wt.HWND(int(parent_hwnd)), collect, 0)
+    for container in containers:
+        if container == parent_hwnd:
+            continue
+        for class_name in ("Edit", "RichEditD2DPT", "NotepadTextBox", "TextBox"):
+            found = find_child_window(container, class_name)
+            if found:
+                return found
     return 0
 
 

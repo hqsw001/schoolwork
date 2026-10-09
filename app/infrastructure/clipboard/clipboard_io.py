@@ -21,6 +21,7 @@ from app.constants import ERR_INTERNAL, MAX_CONTENT_LEN
 from app.domain.models import ClipboardData
 from app.errors import AppError
 from app.infrastructure.clipboard import image_utils
+from app.infrastructure.clipboard import rich_text
 from app.infrastructure.clipboard import win32 as w32
 
 try:
@@ -161,6 +162,11 @@ def read_clipboard_data(options=None):
             html = _read_html_opened(html_id)
             if html:
                 plain = _read_text_opened() or ""
+                # 顺手把命名格式（RTF / 电子表格私有格式）打包进 HTML 注释，
+                # 跟着记录一起走；粘回去时再取出来还原
+                formats = read_named_formats(
+                    format_ids, options.get("source_app"), options.get("logger"))
+                html = rich_text.embed_named_formats(html, formats)
                 return ClipboardData(
                     "rich_text", text=plain, html=html,
                     clipboard_formats=sorted(format_ids),
@@ -238,47 +244,134 @@ def _read_text_opened():
 
 
 def _read_html_opened(html_id):
-    """读取 CF_HTML，按 StartFragment/EndFragment 偏移取出片段。"""
+    """读取 CF_HTML 并取出 HTML 片段。"""
     try:
         raw = win32clipboard.GetClipboardData(html_id)
     except Exception:  # noqa: BLE001
         return None
-    if isinstance(raw, bytes):
-        text = raw.decode("utf-8", "ignore")
-    else:
-        text = str(raw)
-    return extract_html_fragment(text)
+    # 原始字节**直接**交给解析器：CF_HTML 可能是 UTF-8 也可能是 UTF-16LE。
+    # 这里若先 decode("utf-8") 一次，宽字符会被解成夹着一堆 NUL 的字符串，
+    # 后面的 UTF-16 识别就再也没机会生效了（这个坑踩过）。
+    return extract_html_fragment(raw)
 
 
 def extract_html_fragment(cf_html_text):
     """从 CF_HTML 全文中抠出真正的 HTML 片段。
 
-    CF_HTML 的头部是 "键:值" 文本行，其中 StartHTML/StartFragment/EndFragment
-    是**字节**偏移。中文内容下字符数与字节数不一致，因此必须按字节切片，
-    否则富文本会出现截断或乱码。
+    实现搬到 ``rich_text.parse_cf_html``：那里做了 UTF-16 识别、优先整篇
+    偏移（保住 Word 的 CSS）、以及 WPS 被吃掉 ``<`` 的修复。
     """
-    if not cf_html_text:
-        return None
-    offsets = {}
-    for line in cf_html_text.splitlines()[:12]:
-        if ":" not in line:
+    return rich_text.parse_cf_html(cf_html_text)
+
+
+def read_named_formats(format_ids, source_app=None, logger=None):
+    """读取值得保留的命名剪贴板格式（要求剪贴板已打开）。
+
+    只保留两类：
+
+    * **Rich Text Format** —— 任何来源都留。它是"复制 Word/网页 → 粘回
+      支持 RTF 的程序"保真的关键。
+    * **电子表格类来源的私有格式**（Excel / WPS / ET / Calc）—— Biff 之类
+      带着公式与单元格格式，只存 HTML 的话粘回 Excel 会掉格式。
+
+    其余格式（各种 OLE / Shell 内部格式）留着没用，还会把数据库撑大，
+    一律丢弃。
+    """
+    out = []
+    total = 0
+    spreadsheet = looks_like_spreadsheet(source_app)
+    for fmt in format_ids:
+        try:
+            name = win32clipboard.GetClipboardFormatName(fmt)
+        except Exception:  # noqa: BLE001 - 标准格式没有名字，跳过
             continue
-        key, _, value = line.partition(":")
-        key = key.strip().lower()
-        if key in ("starthtml", "endhtml", "startfragment", "endfragment"):
-            try:
-                offsets[key] = int(value.strip())
-            except ValueError:
+        if not name:
+            continue
+        keep = name.lower() == rich_text.RTF_FORMAT_NAME.lower() or spreadsheet
+        if not keep:
+            continue
+        if name.lower() in _NAMED_FORMAT_IGNORE:
+            continue
+        try:
+            data = win32clipboard.GetClipboardData(fmt)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(data, str):
+            data = data.encode("utf-8", "ignore")
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            continue
+        if len(data) > rich_text.MAX_FORMAT_BYTES:
+            continue
+        if total + len(data) > rich_text.MAX_TOTAL_FORMAT_BYTES:
+            break
+        total += len(data)
+        out.append({"name": name, "data": bytes(data)})
+        if len(out) >= rich_text.MAX_FORMAT_COUNT:
+            break
+    return out
+
+
+#: 这些命名格式没必要留（体积大且粘回去也没用）
+_NAMED_FORMAT_IGNORE = frozenset((
+    "html format", "png", "image/png", "jpeg", "jfif", "image/jpeg",
+    "gif", "animated gif", "image/gif", "bitmap", "dib", "dibv5",
+    "dataobject", "ole private data", "embed source", "link source",
+    "object descriptor", "ownerlink", "shell idlist array",
+    "preferred dropeffect", "performed dropeffect", "filegroupdescriptorw",
+    "uniformresourcelocator", "uniformresourcelocatorw", "inetturl",
+))
+
+#: 看起来像电子表格的进程名 / 标题关键字
+_SPREADSHEET_HINTS = ("excel", "wps", "et.exe", "spreadsheet", "calc",
+                      "numbers", "wps.exe", "kingsoft")
+
+
+def looks_like_spreadsheet(source_app):
+    """来源是不是电子表格程序（决定要不要保留它的私有格式）。"""
+    if not source_app:
+        return False
+    lowered = str(source_app).lower()
+    return any(hint in lowered for hint in _SPREADSHEET_HINTS)
+
+
+def _append_named_formats(formats):
+    """在**不清空**剪贴板的前提下追加命名格式。
+
+    必须在 write_text/write_image 之后调用——那些函数开头会
+    ``EmptyClipboard()``，先追加会被清掉。
+    """
+    if not formats:
+        return 0
+    _require_pywintypes()
+    written = 0
+    with clipboard_session(write=True) as ok:
+        if not ok:
+            return 0
+        for item in formats:
+            name = item.get("name")
+            data = item.get("data")
+            if not name or not data:
                 continue
-    data = cf_html_text.encode("utf-8", "ignore")
-    start = offsets.get("startfragment")
-    end = offsets.get("endfragment")
-    if start is None or end is None or start >= end or end > len(data):
-        start = offsets.get("starthtml", 0)
-        end = offsets.get("endhtml", len(data))
-        if start >= end or end > len(data):
-            return cf_html_text.strip() or None
-    return data[start:end].decode("utf-8", "ignore").strip() or None
+            try:
+                fmt = win32clipboard.RegisterClipboardFormat(name)
+                win32clipboard.SetClipboardData(fmt, data)
+                written += 1
+            except Exception:  # noqa: BLE001 - 单个格式失败不影响其他格式
+                continue
+    return written
+
+
+def write_text_html_and_formats(text, html):
+    """写富文本：纯文本 + HTML + 随记录一起走的命名格式。
+
+    TieZ 的做法也是"先写正文与 HTML，再追加命名格式"——顺序不能反。
+    """
+    clean = html or ""
+    clean, formats = rich_text.extract_named_formats(clean)
+    clean, _image = rich_text.extract_image_fallback(clean)
+    write_text_and_html(text or "", clean)
+    _append_named_formats(formats)
+    return True
 
 
 def _read_files_opened():
@@ -374,6 +467,69 @@ def write_files(paths):
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(CF_HDROP, data)
     return True
+
+
+def clear_clipboard():
+    """清空剪贴板。"""
+    _require_pywintypes()
+    with clipboard_session(write=True) as ok:
+        if not ok:
+            return False
+        win32clipboard.EmptyClipboard()
+    return True
+
+
+#: 快照哨兵：剪贴板上确实有内容，但**没有我们能识别的格式**。
+#: 这种情况下还原时什么都不做——总比把用户的原始内容清掉要好。
+SNAPSHOT_UNSUPPORTED = object()
+
+
+def snapshot_clipboard(options=None):
+    """抓一份当前剪贴板的快照，供"临时粘贴"之后还原。
+
+    返回值三态：
+
+    * ``ClipboardData``        —— 正常快照，可以还原
+    * ``SNAPSHOT_UNSUPPORTED`` —— 有内容但读不懂，**不要动它**
+    * ``None``                 —— 剪贴板本来就是空的，还原时清空即可
+    """
+    try:
+        data = read_clipboard_data(options)
+    except Exception:  # noqa: BLE001 - 快照失败不该影响粘贴本身
+        return SNAPSHOT_UNSUPPORTED
+    if data is not None:
+        return data
+    try:
+        if enum_formats():
+            return SNAPSHOT_UNSUPPORTED
+    except Exception:  # noqa: BLE001
+        return SNAPSHOT_UNSUPPORTED
+    return None
+
+
+def restore_clipboard(snapshot):
+    """把快照写回剪贴板。
+
+    只写回我们**读得懂**的那一种格式。剪贴板里原本并存的其他格式
+    （Excel 私有格式之类）在快照时就丢了——这是 Windows 剪贴板模型
+    本身的限制，如实记在这里，不假装能完整还原。
+    """
+    if snapshot is SNAPSHOT_UNSUPPORTED:
+        return False
+    if snapshot is None:
+        return clear_clipboard()
+    try:
+        if snapshot.kind == "image" and snapshot.image_bytes:
+            return write_image(snapshot.image_bytes)
+        if snapshot.kind == "files" and snapshot.files:
+            return write_files(snapshot.files)
+        if snapshot.kind == "rich_text" and snapshot.html:
+            return write_text_and_html(snapshot.text or "", snapshot.html)
+        return write_text(snapshot.text or "")
+    except AppError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise AppError(ERR_INTERNAL, "还原剪贴板失败：%s" % exc)
 
 
 def _require_pywintypes():

@@ -14,9 +14,16 @@ TYPE_CODE = "code"
 TYPE_URL = "url"
 TYPE_IMAGE = "image"
 TYPE_FILE = "file"
+#: 视频文件单独成一类（TieZ 同款）。存储形态与文件类一样是路径列表，
+#: 区别只在类型标记与界面呈现——所以凡是判断"文件类"的地方都要
+#: 用 is_file_type() 而不是直接比 "file"。
+TYPE_VIDEO = "video"
 
-ALL_TYPES = (TYPE_TEXT, TYPE_RICH_TEXT, TYPE_CODE, TYPE_URL, TYPE_IMAGE, TYPE_FILE)
+ALL_TYPES = (TYPE_TEXT, TYPE_RICH_TEXT, TYPE_CODE, TYPE_URL,
+             TYPE_IMAGE, TYPE_FILE, TYPE_VIDEO)
 TEXT_TYPES = (TYPE_TEXT, TYPE_RICH_TEXT, TYPE_CODE, TYPE_URL)
+#: 路径列表形态的类型（粘贴时走 CF_HDROP、可以"打开所在文件夹"）
+FILE_TYPES = (TYPE_FILE, TYPE_VIDEO)
 
 # 类型中文名：界面标签与提示文案统一从这里取
 TYPE_LABELS = {
@@ -26,12 +33,42 @@ TYPE_LABELS = {
     TYPE_URL: "网址",
     TYPE_IMAGE: "图片",
     TYPE_FILE: "文件",
+    TYPE_VIDEO: "视频",
 }
+
+#: 视频扩展名。判"这批文件是不是视频"时用。
+VIDEO_EXTENSIONS = (
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+    ".mpg", ".mpeg", ".ts", ".3gp", ".rmvb", ".rm", ".vob", ".ogv",
+)
 
 
 def is_text_type(content_type):
     """该类型是否为可读文本类型（决定能否编辑、按正文检索）。"""
     return content_type in TEXT_TYPES
+
+
+def is_file_type(content_type):
+    """该类型的内容是不是**磁盘路径列表**。
+
+    文件与视频在存储上完全一样，判断时要用这个而不是直接比 ``"file"``，
+    否则新增类型时很容易漏掉某个分支。
+    """
+    return content_type in FILE_TYPES
+
+
+def looks_like_video(paths):
+    """这批路径是不是视频。**全部**是视频才算，混合的不算。"""
+    items = [p for p in (paths or []) if str(p).strip()]
+    if not items:
+        return False
+    for path in items:
+        name = str(path).strip().strip('"').lower()
+        # 允许带查询串的 URL（有些视频源是链接）
+        name = name.split("?", 1)[0]
+        if not name.endswith(VIDEO_EXTENSIONS):
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -77,17 +114,73 @@ K_CAPTURE_RICH_TEXT = "app.capture_rich_text"
 K_CAPTURE_FILES = "app.capture_files"
 K_DELETE_AFTER_PASTE = "app.delete_after_paste"
 K_CLEANUP_RULES = "app.cleanup_rules"
+#: 应用级规则（JSON）：按来源应用"忽略采集"或"自动清洗"
+K_APP_CLEANUP_POLICIES = "app.app_cleanup_policies"
 K_PRIVACY_PROTECTION = "app.privacy_protection"
 K_PRIVACY_KINDS = "app.privacy_protection_kinds"
+#: 用户自定义的敏感识别规则，每行一条正则
+K_PRIVACY_CUSTOM_RULES = "app.privacy_protection_custom_rules"
+#: 脱敏时前后各保留几位可见（TieZ 的掩码设置）
+K_MASK_PREFIX = "app.sensitive_mask_prefix_visible"
+K_MASK_SUFFIX = "app.sensitive_mask_suffix_visible"
+#: 邮箱脱敏时是否连域名一起打码
+K_MASK_EMAIL_DOMAIN = "app.sensitive_mask_email_domain"
 K_THEME = "app.theme"
 K_THEME_MODE = "app.theme_mode"
 K_LIST_DENSITY = "app.list_density"
 K_MAIN_HOTKEY = "app.main_hotkey"
 K_SEARCH_HOTKEY = "app.search_hotkey"
+#: 顺序粘贴模式：开启后每复制一条就自动进队，"顺序粘贴"快捷键逐条粘出
+K_SEQUENTIAL_MODE = "app.sequential_mode"
+#: 顺序粘贴快捷键（只在顺序模式开启时注册）
+K_SEQUENTIAL_HOTKEY = "app.sequential_hotkey"
+#: 带格式粘贴快捷键：不开面板，直接把最新一条带格式粘到当前窗口
+K_RICH_PASTE_HOTKEY = "app.rich_paste_hotkey"
+
+#: 内置标签。它们关联着"敏感信息保护"，因此**禁止改名与删除**：
+#: 改了名之后新采集的敏感内容就不会再被打上标记，保护会静默失效。
+PROTECTED_TAGS = ("sensitive", "密码", "password")
+
+#: 给记录打上这几个标签，就等同于把它标记为敏感 —— 于是加密落盘。
+#: 与 PROTECTED_TAGS 是同一组：受保护的标签也正是"触发保护"的标签。
+SENSITIVE_TAGS = PROTECTED_TAGS
+
+
+def is_protected_tag(tag):
+    """是不是内置保护标签（大小写不敏感）。"""
+    return bool(tag) and str(tag).strip().lower() in PROTECTED_TAGS
+
+
+def is_sensitive_tag(tag):
+    """这个标签是否意味着"这条记录该加密"。"""
+    return bool(tag) and str(tag).strip().lower() in SENSITIVE_TAGS
 K_EDGE_DOCKING = "app.edge_docking"
 K_FOLLOW_MOUSE = "app.follow_mouse"
+#: 失焦时不要自动隐藏（默认关：多数人希望点别处面板就收起来）
+K_IGNORE_BLUR = "app.ignore_blur"
+#: 窗口固定：一直留在最前且失焦也不隐藏（临时查资料时用）
+K_WINDOW_PINNED = "app.window_pinned"
+#: 是否显示托盘图标
+K_TRAY_VISIBLE = "app.tray_visible"
+#: 方向键是否参与列表选择
+K_ARROW_KEY_SELECTION = "app.arrow_key_selection"
+#: 方向键的选择模式：list（列表上下）/ grid（卡片网格）/ none（关闭）
+K_NAVIGATION_MODE = "app.navigation_mode"
+
+#: 是否开启悬停预览浮窗
+K_PREVIEW_ENABLED = "app.preview_enabled"
+#: 悬停多久才弹出（毫秒）。太短会"鼠标划过就闪一下"，太长又显得迟钝
+K_PREVIEW_DELAY_MS = "app.preview_delay_ms"
+
+#: 预览浮窗最多显示多少字符（超出部分明确标注已截断）
+PREVIEW_MAX_CHARS = 4000
+
 K_SILENT_START = "app.silent_start"
 K_SOUND_ENABLED = "app.sound_enabled"
+#: 提示音音量（0~100）
+K_SOUND_VOLUME = "app.sound_volume"
+#: 粘贴时是否也响（复制音与粘贴音可以分开关）
+K_PASTE_SOUND_ENABLED = "app.paste_sound_enabled"
 #: 面板是否总在最前。关掉之后面板会像普通窗口一样被其他窗口盖住，
 #: 适合"想一边看资料一边翻剪贴板"的用法。
 K_ALWAYS_ON_TOP = "app.always_on_top"

@@ -341,3 +341,44 @@ def simulate_key(accelerator, logger=None):
     """按配置的加速器发一次按键（顺序粘贴等场景备用）。"""
     modifiers, vk = parse_accelerator(accelerator)
     return send_key_combo(vk, modifiers, logger)
+
+
+def is_key_down(vk):
+    """某个键当前是否被**物理按住**（GetAsyncKeyState 的最高位）。"""
+    try:
+        return bool(w32.user32.GetAsyncKeyState(int(vk)) & 0x8000)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def hold_key(vk):
+    """把一个键重新按下（不发抬起）。
+
+    顺序粘贴的用法是"按住 Alt 连按 V"：系统处理热键时会把 Alt 吃掉，
+    不补一次按下的话，第二下 V 就不再构成 Alt+V，连续粘贴会断掉。
+    """
+    try:
+        w32.user32.keybd_event(int(vk), 0, 0, 0)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: Alt 的虚拟键码（顺序粘贴的默认修饰键）
+VK_ALT = 0x12
+
+
+def alt_is_down():
+    """Alt 当前是否被物理按住（决定要不要在粘完后补按一次）。"""
+    return is_key_down(VK_ALT)
+
+
+def restore_alt(was_down):
+    """如果粘贴前 Alt 是按住的，粘完把它重新按下。
+
+    这正是"按住 Alt 连按 V"能连续工作的原因：每次热键触发后系统都会
+    松开 Alt，不补一次的话第二次 V 就失效了。
+    """
+    if not was_down:
+        return False
+    return hold_key(VK_ALT)

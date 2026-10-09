@@ -107,6 +107,12 @@ NIM_DELETE = 2
 NIF_MESSAGE = 0x01
 NIF_ICON = 0x02
 NIF_TIP = 0x04
+NIF_INFO = 0x10
+#: 气泡提示图标（NIIF_*）
+NIIF_NONE = 0x00
+NIIF_INFO = 0x01
+NIIF_WARNING = 0x02
+NIIF_ERROR = 0x03
 IDI_APPLICATION = 32512
 
 # 弹出菜单
@@ -264,6 +270,10 @@ if IS_WINDOWS:
     #: 让系统认为本进程刚收到过用户输入，SetForegroundWindow 才会放行
     user32.keybd_event.restype = None
     user32.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, wt.DWORD, ULONG_PTR]
+
+    # 顺序粘贴要知道 Alt 是不是被物理按住（"按住 Alt 连按 V"那种用法）
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 
     user32.GetWindowThreadProcessId.restype = wt.DWORD
     user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
