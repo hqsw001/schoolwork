@@ -4,8 +4,6 @@ Windows 桌面端剪贴板管理器。**纯单机、不联网、零云端依赖*
 把系统剪贴板从"一个临时缓冲区"变成"一个可检索、可组织的本地信息库"。
 
 - 实现语言：**Python 3.12 + tkinter**（标准库 + Pillow + pywin32）
-- 参照开源项目 [TieZ Clipboard](https://github.com/jimuzhe/tiez-clipboard)（Tauri + Rust）
-  的分层设计重写，并按要求砍掉全部联网能力
 - 详细设计与分阶段记录见 [`文档/`](文档/)
 
 ---
