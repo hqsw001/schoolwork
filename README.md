@@ -10,8 +10,6 @@ Windows 桌面端剪贴板管理器。**纯单机、不联网、零云端依赖*
 
 ## 下载即用（不需要装 Python）
 
-**⬇ [下载 pastePro-v0.01.zip](https://github.com/hqsw001/schoolwork/releases/download/1st/pastePro-v0.01.zip)**
-
 1. 解压得到 `剪贴板Pro` 文件夹
 2. 双击 `剪贴板Pro.exe` —— 没有主窗口，程序直接驻留系统托盘
 3. 在任意软件里按 `Ctrl+Shift+V` 唤出面板，双击卡片即粘贴回去
